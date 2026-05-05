@@ -4,8 +4,8 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
-#include <Wire.h>           // ¡Nuevo: Para el bus I2C!
-#include <Adafruit_AHTX0.h> // ¡Nuevo: Librería del Clima!
+#include <Wire.h>             
+#include <Adafruit_AHTX0.h>   
 
 // --- PINES DE LA PANTALLA TFT ---
 #define TFT_CS 15
@@ -14,27 +14,40 @@
 
 // --- PINES DEL MAESTRO ---
 #define TRIG_PIN 5
-#define ECHO_PIN 12
-#define IR_PIN 19
+#define ECHO_PIN 12 
+#define IR_PIN 19   
 #define LDR_PIN 34
-#define BOTON_PIN 13
+#define BOTON_PIN 13 
 #define BUZZER_PIN 25
 
 // --- PINES TOUCH DEL ELEVADOR ---
 #define PIN_TOUCH1 36
 #define PIN_TOUCH2 39
 
-// --- AJUSTES EDITABLES ---
+// --- AJUSTES EDITABLES GENERALES ---
 const int umbralLuz = 1000;
 const int distanciaMinima = 5;
 const int distanciaMaxima = 15;
 const unsigned long tiempoEsperaLeds = 3000;
 const unsigned long tiempoEsperaEntrada = 3000;
 
-// --- AJUSTES DE CLIMA ---
+unsigned long ultimaVezDetectadoPasillo = 0;
+unsigned long ultimaVezDetectadoEntrada = 0;
+bool fiestaActiva = false;
+
+// --- AJUSTES DE CLIMA (AHT20) ---
 Adafruit_AHTX0 aht;
-float tempUmbral = 30.0;              // A esta temperatura manda encender
-unsigned long ultimaLecturaClima = 0; // Reloj para no saturar el sensor
+float tempUmbral = 30.0; 
+unsigned long ultimaLecturaClima = 0; 
+
+// --- AJUSTES DE SISMO (MPU-6050) ---
+const int MPU = 0x68; 
+int16_t AcX, AcY, AcZ;
+long baseAcX = 0, baseAcY = 0, baseAcZ = 0;
+int umbralSismo = 3000; // <--- AJUSTA TU SENSIBILIDAD AQUÍ
+unsigned long ultimoMilisSensor = 0;   
+bool sismoActivo = false;
+int repeticionesSismo = 0;
 
 // --- MÚSICA: AXEL F ---
 int melodiaFiesta[] = {466, 0, 523, 466, 466, 587, 466, 415, 466, 0, 698, 466, 466, 784, 698, 523, 466, 698, 932, 466, 415, 415, 349, 523, 466};
@@ -43,9 +56,12 @@ int totalNotas = 25;
 int notaActual = 0;
 unsigned long tiempoUltimaNota = 0;
 
-unsigned long ultimaVezDetectadoPasillo = 0;
-unsigned long ultimaVezDetectadoEntrada = 0;
-bool fiestaActiva = false;
+// --- MÚSICA: ALERTA SÍSMICA ---
+int melodiaSismo[] = {300, 325, 350, 375, 400, 425, 450, 475, 500, 525, 550, 575, 600, 625, 650, 675, 700, 725, 750, 0};
+int duracionSismo[] = {30,  30,  30,  30,  30,  30,  30,  30,  30,  30,  30,  30,  30,  30,  30,  30,  30,  30,  30, 400};
+int totalNotasSismo = 20;
+int notaActualSismo = 0;
+unsigned long tiempoUltimaNotaSismo = 0;
 
 // MAC del Esclavo
 uint8_t slaveAddress[] = {0x08, 0xD1, 0xF9, 0xD2, 0x22, 0xF4};
@@ -53,15 +69,15 @@ uint8_t slaveAddress[] = {0x08, 0xD1, 0xF9, 0xD2, 0x22, 0xF4};
 // Objeto de la pantalla
 Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
 
-// --- DICCIONARIO ACTUALIZADO ---
+// --- DICCIONARIO ESP-NOW ---
 typedef struct struct_message
 {
     bool presenciaPasillo;
     bool presenciaEntrada;
     bool fiestaActiva;
-    bool touchPiso1;
-    bool touchPiso2;
-    bool ventiladorActivo; // ¡Nuevo dato para el clima!
+    bool touchPiso1; 
+    bool touchPiso2; 
+    bool ventiladorActivo; 
 } struct_message;
 
 struct_message datosParaEnviar;
@@ -71,11 +87,39 @@ void setup()
 {
     Serial.begin(115200);
 
-    // Iniciar sensor de Clima (Sin while(1) para que no congele el edificio si falla)
-    if (!aht.begin())
-    {
+    // --- SETUP DE I2C Y SENSORES ---
+    Wire.begin();
+    
+    if (!aht.begin()) {
         Serial.println("Advertencia: Sensor AHT no detectado.");
     }
+
+    // Despertar y calibrar MPU-6050
+    Wire.beginTransmission(MPU);
+    Wire.write(0x6B); 
+    Wire.write(0);    
+    Wire.endTransmission(true);
+
+    Serial.println("Calibrando Sismo... ¡NO TOQUES LA MAQUETA!");
+    delay(2000); 
+
+    for (int i = 0; i < 100; i++) {
+        Wire.beginTransmission(MPU);
+        Wire.write(0x3B); 
+        Wire.endTransmission(false);
+        Wire.requestFrom(MPU, 6, true);
+        
+        int16_t tempX = Wire.read() << 8 | Wire.read();
+        int16_t tempY = Wire.read() << 8 | Wire.read();
+        int16_t tempZ = Wire.read() << 8 | Wire.read();
+        
+        baseAcX += tempX;
+        baseAcY += tempY;
+        baseAcZ += tempZ;
+        delay(10); 
+    }
+    baseAcX /= 100; baseAcY /= 100; baseAcZ /= 100;
+    Serial.println("Calibración Sísmica Lista.");
 
     // --- SETUP DE LA PANTALLA ---
     tft.begin();
@@ -103,14 +147,11 @@ void setup()
     pinMode(IR_PIN, INPUT);
     pinMode(BOTON_PIN, INPUT_PULLUP);
     pinMode(BUZZER_PIN, OUTPUT);
-
-    // Pines de los Touch
     pinMode(PIN_TOUCH1, INPUT);
     pinMode(PIN_TOUCH2, INPUT);
 
     WiFi.mode(WIFI_STA);
-    if (esp_now_init() != ESP_OK)
-        return;
+    if (esp_now_init() != ESP_OK) return;
     memcpy(peerInfo.peer_addr, slaveAddress, 6);
     peerInfo.channel = 0;
     peerInfo.encrypt = false;
@@ -121,7 +162,7 @@ void loop()
 {
     unsigned long tiempoActual = millis();
 
-    // 1. PASILLO
+    // 1. PASILLO (Ultrasonido)
     digitalWrite(TRIG_PIN, LOW);
     delayMicroseconds(2);
     digitalWrite(TRIG_PIN, HIGH);
@@ -129,86 +170,115 @@ void loop()
     digitalWrite(TRIG_PIN, LOW);
     int distancia = (pulseIn(ECHO_PIN, HIGH)) * 0.034 / 2;
 
-    if (distancia >= distanciaMinima && distancia <= distanciaMaxima)
-    {
+    if (distancia >= distanciaMinima && distancia <= distanciaMaxima) {
         ultimaVezDetectadoPasillo = tiempoActual;
         datosParaEnviar.presenciaPasillo = true;
-    }
-    else
-    {
+    } else {
         datosParaEnviar.presenciaPasillo = (tiempoActual - ultimaVezDetectadoPasillo < tiempoEsperaLeds);
     }
 
-    // 2. ENTRADA
-    if (digitalRead(IR_PIN) == LOW)
-    {
+    // 2. ENTRADA (Infrarrojo)
+    if (digitalRead(IR_PIN) == LOW) {
         ultimaVezDetectadoEntrada = tiempoActual;
         datosParaEnviar.presenciaEntrada = true;
-    }
-    else
-    {
+    } else {
         datosParaEnviar.presenciaEntrada = (tiempoActual - ultimaVezDetectadoEntrada < tiempoEsperaEntrada);
     }
 
-    // 3. FIESTA
+    // 3. FIESTA (LDR y Botón)
     int valorLuz = analogRead(LDR_PIN);
-    if (valorLuz > umbralLuz)
-    {
+    if (valorLuz > umbralLuz) {
         fiestaActiva = false;
-    }
-    else if (digitalRead(BOTON_PIN) == LOW)
-    {
+    } else if (digitalRead(BOTON_PIN) == LOW) {
         fiestaActiva = true;
     }
     datosParaEnviar.fiestaActiva = fiestaActiva;
 
-    // 4. MÚSICA
-    if (fiestaActiva)
-    {
-        if (tiempoActual - tiempoUltimaNota >= duracionNotas[notaActual])
-        {
-            if (melodiaFiesta[notaActual] > 0)
-            {
-                tone(BUZZER_PIN, melodiaFiesta[notaActual], duracionNotas[notaActual] - 20);
-            }
-            else
-            {
-                noTone(BUZZER_PIN);
-            }
-            notaActual++;
-            if (notaActual >= totalNotas)
-                notaActual = 0;
-            tiempoUltimaNota = tiempoActual;
-        }
-    }
-    else
-    {
-        noTone(BUZZER_PIN);
-        notaActual = 0;
-    }
-
-    // 5. ELEVADOR
+    // 4. ELEVADOR (Touch)
     datosParaEnviar.touchPiso1 = digitalRead(PIN_TOUCH1);
     datosParaEnviar.touchPiso2 = digitalRead(PIN_TOUCH2);
 
-    // 6. LECTURA DE CLIMA (Cada 2 segundos)
-    if (tiempoActual - ultimaLecturaClima >= 2000)
-    {
+    // 5. CLIMA (AHT20 - Cada 2 segundos)
+    if (tiempoActual - ultimaLecturaClima >= 2000) {
         sensors_event_t humedad, temperatura;
         aht.getEvent(&humedad, &temperatura);
-
-        if (temperatura.temperature >= tempUmbral)
-        {
+        
+        if (temperatura.temperature >= tempUmbral) {
             datosParaEnviar.ventiladorActivo = true;
-        }
-        else
-        {
+        } else {
             datosParaEnviar.ventiladorActivo = false;
         }
         ultimaLecturaClima = tiempoActual;
     }
 
-    // Enviar paquete completo por ESP-NOW
+    // 6. SISMO (MPU-6050 - Cada 50 milisegundos)
+    if (tiempoActual - ultimoMilisSensor >= 50) {
+        ultimoMilisSensor = tiempoActual;
+
+        Wire.beginTransmission(MPU);
+        Wire.write(0x3B);  
+        Wire.endTransmission(false);
+        Wire.requestFrom(MPU, 6, true); 
+
+        AcX = Wire.read() << 8 | Wire.read();  
+        AcY = Wire.read() << 8 | Wire.read();  
+        AcZ = Wire.read() << 8 | Wire.read();  
+
+        long difX = (long)AcX - baseAcX; if (difX < 0) difX = -difX; 
+        long difY = (long)AcY - baseAcY; if (difY < 0) difY = -difY; 
+        long difZ = (long)AcZ - baseAcZ; if (difZ < 0) difZ = -difZ; 
+
+        if ((difX > umbralSismo || difY > umbralSismo || difZ > umbralSismo) && !sismoActivo) {
+            sismoActivo = true;
+            notaActualSismo = 0;
+            repeticionesSismo = 0;
+            tiempoUltimaNotaSismo = tiempoActual; 
+            Serial.println("🚨 ¡TERREMOTO DETECTADO! 🚨");
+        }
+    }
+
+    // 7. CONTROL MAESTRO DE AUDIO (Jerarquía)
+    if (sismoActivo) {
+        // PRIORIDAD 1: ALERTA SÍSMICA
+        if (tiempoActual - tiempoUltimaNotaSismo >= duracionSismo[notaActualSismo]) {
+            if (melodiaSismo[notaActualSismo] > 0) {
+                tone(BUZZER_PIN, melodiaSismo[notaActualSismo], duracionSismo[notaActualSismo] - 5);
+            } else {
+                noTone(BUZZER_PIN);
+            }
+            notaActualSismo++;
+            if (notaActualSismo >= totalNotasSismo) {
+                notaActualSismo = 0; 
+                repeticionesSismo++; 
+                if (repeticionesSismo >= 4) {
+                    sismoActivo = false;
+                    notaActual = 0; // Reseteamos Axel F por si retoma
+                }
+            }
+            tiempoUltimaNotaSismo = tiempoActual;
+        }
+    } 
+    else if (fiestaActiva) {
+        // PRIORIDAD 2: MODO FIESTA (Axel F)
+        if (tiempoActual - tiempoUltimaNota >= duracionNotas[notaActual]) {
+            if (melodiaFiesta[notaActual] > 0) {
+                tone(BUZZER_PIN, melodiaFiesta[notaActual], duracionNotas[notaActual] - 20);
+            } else {
+                noTone(BUZZER_PIN);
+            }
+            notaActual++;
+            if (notaActual >= totalNotas) notaActual = 0;
+            tiempoUltimaNota = tiempoActual;
+        }
+    } 
+    else {
+        // SILENCIO TOTAL
+        noTone(BUZZER_PIN);
+        notaActual = 0;
+        notaActualSismo = 0;
+    }
+
+    // 8. ENVIAR DATOS AL ESCLAVO
     esp_now_send(slaveAddress, (uint8_t *)&datosParaEnviar, sizeof(datosParaEnviar));
     delay(20);
 }
