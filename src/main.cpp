@@ -4,6 +4,8 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
+#include <Wire.h>           // ¡Nuevo: Para el bus I2C!
+#include <Adafruit_AHTX0.h> // ¡Nuevo: Librería del Clima!
 
 // --- PINES DE LA PANTALLA TFT ---
 #define TFT_CS 15
@@ -18,7 +20,7 @@
 #define BOTON_PIN 13
 #define BUZZER_PIN 25
 
-// --- NUEVOS PINES: TOUCH DEL ELEVADOR ---
+// --- PINES TOUCH DEL ELEVADOR ---
 #define PIN_TOUCH1 36
 #define PIN_TOUCH2 39
 
@@ -28,6 +30,11 @@ const int distanciaMinima = 5;
 const int distanciaMaxima = 15;
 const unsigned long tiempoEsperaLeds = 3000;
 const unsigned long tiempoEsperaEntrada = 3000;
+
+// --- AJUSTES DE CLIMA ---
+Adafruit_AHTX0 aht;
+float tempUmbral = 30.0;              // A esta temperatura manda encender
+unsigned long ultimaLecturaClima = 0; // Reloj para no saturar el sensor
 
 // --- MÚSICA: AXEL F ---
 int melodiaFiesta[] = {466, 0, 523, 466, 466, 587, 466, 415, 466, 0, 698, 466, 466, 784, 698, 523, 466, 698, 932, 466, 415, 415, 349, 523, 466};
@@ -52,8 +59,9 @@ typedef struct struct_message
     bool presenciaPasillo;
     bool presenciaEntrada;
     bool fiestaActiva;
-    bool touchPiso1; // ¡Nuevo!
-    bool touchPiso2; // ¡Nuevo!
+    bool touchPiso1;
+    bool touchPiso2;
+    bool ventiladorActivo; // ¡Nuevo dato para el clima!
 } struct_message;
 
 struct_message datosParaEnviar;
@@ -62,6 +70,12 @@ esp_now_peer_info_t peerInfo;
 void setup()
 {
     Serial.begin(115200);
+
+    // Iniciar sensor de Clima (Sin while(1) para que no congele el edificio si falla)
+    if (!aht.begin())
+    {
+        Serial.println("Advertencia: Sensor AHT no detectado.");
+    }
 
     // --- SETUP DE LA PANTALLA ---
     tft.begin();
@@ -173,10 +187,28 @@ void loop()
         notaActual = 0;
     }
 
-    // 5. ELEVADOR (Lectura de los Touch)
+    // 5. ELEVADOR
     datosParaEnviar.touchPiso1 = digitalRead(PIN_TOUCH1);
     datosParaEnviar.touchPiso2 = digitalRead(PIN_TOUCH2);
 
+    // 6. LECTURA DE CLIMA (Cada 2 segundos)
+    if (tiempoActual - ultimaLecturaClima >= 2000)
+    {
+        sensors_event_t humedad, temperatura;
+        aht.getEvent(&humedad, &temperatura);
+
+        if (temperatura.temperature >= tempUmbral)
+        {
+            datosParaEnviar.ventiladorActivo = true;
+        }
+        else
+        {
+            datosParaEnviar.ventiladorActivo = false;
+        }
+        ultimaLecturaClima = tiempoActual;
+    }
+
+    // Enviar paquete completo por ESP-NOW
     esp_now_send(slaveAddress, (uint8_t *)&datosParaEnviar, sizeof(datosParaEnviar));
     delay(20);
 }
