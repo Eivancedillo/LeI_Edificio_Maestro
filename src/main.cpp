@@ -19,12 +19,13 @@
 #define LDR_PIN 34
 #define BOTON_PIN 13 
 #define BUZZER_PIN 25
+#define PIN_AGUA 35    // <--- ¡NUEVO: PIN DEL SENSOR DE LLUVIA!
 
 // --- PINES TOUCH DEL ELEVADOR ---
 #define PIN_TOUCH1 36
 #define PIN_TOUCH2 39
 
-// --- AJUSTES EDITABLES GENERALES ---
+// --- AJUSTES GENERALES ---
 const int umbralLuz = 1000;
 const int distanciaMinima = 5;
 const int distanciaMaxima = 15;
@@ -44,12 +45,17 @@ unsigned long ultimaLecturaClima = 0;
 const int MPU = 0x68; 
 int16_t AcX, AcY, AcZ;
 long baseAcX = 0, baseAcY = 0, baseAcZ = 0;
-int umbralSismo = 3000; // <--- AJUSTA TU SENSIBILIDAD AQUÍ
+int umbralSismo = 3000; 
 unsigned long ultimoMilisSensor = 0;   
 bool sismoActivo = false;
 int repeticionesSismo = 0;
 
-// --- MÚSICA: AXEL F ---
+// --- AJUSTES DE LLUVIA ---
+int umbralLluvia = 500; 
+unsigned long ultimoMilisAgua = 0;
+bool lluviaActiva = false;
+
+// --- MÚSICA: AXEL F (FIESTA) ---
 int melodiaFiesta[] = {466, 0, 523, 466, 466, 587, 466, 415, 466, 0, 698, 466, 466, 784, 698, 523, 466, 698, 932, 466, 415, 415, 349, 523, 466};
 int duracionNotas[] = {150, 50, 150, 150, 50, 150, 150, 150, 150, 50, 150, 150, 50, 150, 150, 150, 150, 150, 150, 50, 150, 50, 150, 150, 400};
 int totalNotas = 25;
@@ -62,6 +68,13 @@ int duracionSismo[] = {30,  30,  30,  30,  30,  30,  30,  30,  30,  30,  30,  30
 int totalNotasSismo = 20;
 int notaActualSismo = 0;
 unsigned long tiempoUltimaNotaSismo = 0;
+
+// --- MÚSICA: ALERTA DE LLUVIA ---
+int melodiaLluvia[] = {1000, 0, 1200, 0};
+int duracionLluvia[] = {50,  50,  50,  1000}; 
+int totalNotasLluvia = 4;
+int notaActualLluvia = 0;
+unsigned long tiempoUltimaNotaLluvia = 0;
 
 // MAC del Esclavo
 uint8_t slaveAddress[] = {0x08, 0xD1, 0xF9, 0xD2, 0x22, 0xF4};
@@ -87,14 +100,12 @@ void setup()
 {
     Serial.begin(115200);
 
-    // --- SETUP DE I2C Y SENSORES ---
     Wire.begin();
     
     if (!aht.begin()) {
         Serial.println("Advertencia: Sensor AHT no detectado.");
     }
 
-    // Despertar y calibrar MPU-6050
     Wire.beginTransmission(MPU);
     Wire.write(0x6B); 
     Wire.write(0);    
@@ -121,26 +132,22 @@ void setup()
     baseAcX /= 100; baseAcY /= 100; baseAcZ /= 100;
     Serial.println("Calibración Sísmica Lista.");
 
-    // --- SETUP DE LA PANTALLA ---
+    // --- SETUP PANTALLA ---
     tft.begin();
     tft.setRotation(1);
     tft.fillScreen(ILI9341_BLACK);
-
     tft.setCursor(10, 30);
     tft.setTextColor(ILI9341_GREEN);
     tft.setTextSize(3);
     tft.println("Edificio inteligente");
-
     tft.setCursor(10, 65);
     tft.setTextColor(ILI9341_CYAN);
     tft.setTextSize(1);
     tft.println("Lenguajes e Interdaces");
-
     tft.setCursor(10, 100);
     tft.setTextColor(ILI9341_WHITE);
     tft.setTextSize(2);
     tft.println("Sistema en Linea");
-    // ----------------------------
 
     pinMode(TRIG_PIN, OUTPUT);
     pinMode(ECHO_PIN, INPUT);
@@ -149,6 +156,7 @@ void setup()
     pinMode(BUZZER_PIN, OUTPUT);
     pinMode(PIN_TOUCH1, INPUT);
     pinMode(PIN_TOUCH2, INPUT);
+    // Pin 35 (Agua) no necesita pinMode al ser analógico puro.
 
     WiFi.mode(WIFI_STA);
     if (esp_now_init() != ESP_OK) return;
@@ -162,7 +170,7 @@ void loop()
 {
     unsigned long tiempoActual = millis();
 
-    // 1. PASILLO (Ultrasonido)
+    // 1. PASILLO
     digitalWrite(TRIG_PIN, LOW);
     delayMicroseconds(2);
     digitalWrite(TRIG_PIN, HIGH);
@@ -177,7 +185,7 @@ void loop()
         datosParaEnviar.presenciaPasillo = (tiempoActual - ultimaVezDetectadoPasillo < tiempoEsperaLeds);
     }
 
-    // 2. ENTRADA (Infrarrojo)
+    // 2. ENTRADA
     if (digitalRead(IR_PIN) == LOW) {
         ultimaVezDetectadoEntrada = tiempoActual;
         datosParaEnviar.presenciaEntrada = true;
@@ -185,7 +193,7 @@ void loop()
         datosParaEnviar.presenciaEntrada = (tiempoActual - ultimaVezDetectadoEntrada < tiempoEsperaEntrada);
     }
 
-    // 3. FIESTA (LDR y Botón)
+    // 3. FIESTA
     int valorLuz = analogRead(LDR_PIN);
     if (valorLuz > umbralLuz) {
         fiestaActiva = false;
@@ -194,11 +202,11 @@ void loop()
     }
     datosParaEnviar.fiestaActiva = fiestaActiva;
 
-    // 4. ELEVADOR (Touch)
+    // 4. ELEVADOR
     datosParaEnviar.touchPiso1 = digitalRead(PIN_TOUCH1);
     datosParaEnviar.touchPiso2 = digitalRead(PIN_TOUCH2);
 
-    // 5. CLIMA (AHT20 - Cada 2 segundos)
+    // 5. CLIMA
     if (tiempoActual - ultimaLecturaClima >= 2000) {
         sensors_event_t humedad, temperatura;
         aht.getEvent(&humedad, &temperatura);
@@ -211,10 +219,9 @@ void loop()
         ultimaLecturaClima = tiempoActual;
     }
 
-    // 6. SISMO (MPU-6050 - Cada 50 milisegundos)
+    // 6. SISMO (Cada 50ms)
     if (tiempoActual - ultimoMilisSensor >= 50) {
         ultimoMilisSensor = tiempoActual;
-
         Wire.beginTransmission(MPU);
         Wire.write(0x3B);  
         Wire.endTransmission(false);
@@ -233,13 +240,28 @@ void loop()
             notaActualSismo = 0;
             repeticionesSismo = 0;
             tiempoUltimaNotaSismo = tiempoActual; 
-            Serial.println("🚨 ¡TERREMOTO DETECTADO! 🚨");
         }
     }
 
-    // 7. CONTROL MAESTRO DE AUDIO (Jerarquía)
+    // 7. LLUVIA (Cada 500ms)
+    if (tiempoActual - ultimoMilisAgua >= 500) {
+        int lecturaAgua = analogRead(PIN_AGUA);
+        ultimoMilisAgua = tiempoActual;
+        
+        if (lecturaAgua > umbralLluvia) {
+            if (!lluviaActiva) {
+                lluviaActiva = true;
+                notaActualLluvia = 0;
+                tiempoUltimaNotaLluvia = tiempoActual;
+            }
+        } else {
+            lluviaActiva = false;
+        }
+    }
+
+    // 8. CONTROL MAESTRO DE AUDIO (Jerarquía)
     if (sismoActivo) {
-        // PRIORIDAD 1: ALERTA SÍSMICA
+        // PRIORIDAD 1: SISMO
         if (tiempoActual - tiempoUltimaNotaSismo >= duracionSismo[notaActualSismo]) {
             if (melodiaSismo[notaActualSismo] > 0) {
                 tone(BUZZER_PIN, melodiaSismo[notaActualSismo], duracionSismo[notaActualSismo] - 5);
@@ -252,14 +274,30 @@ void loop()
                 repeticionesSismo++; 
                 if (repeticionesSismo >= 4) {
                     sismoActivo = false;
-                    notaActual = 0; // Reseteamos Axel F por si retoma
+                    notaActual = 0; // Reset fiesta
+                    notaActualLluvia = 0; // Reset lluvia
                 }
             }
             tiempoUltimaNotaSismo = tiempoActual;
         }
     } 
+    else if (lluviaActiva) {
+        // PRIORIDAD 2: LLUVIA
+        if (tiempoActual - tiempoUltimaNotaLluvia >= duracionLluvia[notaActualLluvia]) {
+            if (melodiaLluvia[notaActualLluvia] > 0) {
+                tone(BUZZER_PIN, melodiaLluvia[notaActualLluvia], duracionLluvia[notaActualLluvia] - 5);
+            } else {
+                noTone(BUZZER_PIN);
+            }
+            notaActualLluvia++;
+            if (notaActualLluvia >= totalNotasLluvia) {
+                notaActualLluvia = 0; 
+            }
+            tiempoUltimaNotaLluvia = tiempoActual;
+        }
+    }
     else if (fiestaActiva) {
-        // PRIORIDAD 2: MODO FIESTA (Axel F)
+        // PRIORIDAD 3: FIESTA (Axel F)
         if (tiempoActual - tiempoUltimaNota >= duracionNotas[notaActual]) {
             if (melodiaFiesta[notaActual] > 0) {
                 tone(BUZZER_PIN, melodiaFiesta[notaActual], duracionNotas[notaActual] - 20);
@@ -276,9 +314,10 @@ void loop()
         noTone(BUZZER_PIN);
         notaActual = 0;
         notaActualSismo = 0;
+        notaActualLluvia = 0;
     }
 
-    // 8. ENVIAR DATOS AL ESCLAVO
+    // 9. ENVIAR DATOS AL ESCLAVO
     esp_now_send(slaveAddress, (uint8_t *)&datosParaEnviar, sizeof(datosParaEnviar));
     delay(20);
 }
