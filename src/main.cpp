@@ -10,13 +10,17 @@
 #define TFT_DC 2
 #define TFT_RST 4
 
-// --- PINES DEL MAESTRO (Actualizados) ---
+// --- PINES DEL MAESTRO ---
 #define TRIG_PIN 5
-#define ECHO_PIN 12 // ¡Nuevo hogar!
-#define IR_PIN 19   // ¡Nuevo hogar!
+#define ECHO_PIN 12
+#define IR_PIN 19
 #define LDR_PIN 34
-#define BOTON_PIN 13 // ¡Nuevo hogar!
+#define BOTON_PIN 13
 #define BUZZER_PIN 25
+
+// --- NUEVOS PINES: TOUCH DEL ELEVADOR ---
+#define PIN_TOUCH1 36
+#define PIN_TOUCH2 39
 
 // --- AJUSTES EDITABLES ---
 const int umbralLuz = 1000;
@@ -42,11 +46,14 @@ uint8_t slaveAddress[] = {0x08, 0xD1, 0xF9, 0xD2, 0x22, 0xF4};
 // Objeto de la pantalla
 Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
 
+// --- DICCIONARIO ACTUALIZADO ---
 typedef struct struct_message
 {
     bool presenciaPasillo;
     bool presenciaEntrada;
     bool fiestaActiva;
+    bool touchPiso1; // ¡Nuevo!
+    bool touchPiso2; // ¡Nuevo!
 } struct_message;
 
 struct_message datosParaEnviar;
@@ -82,6 +89,10 @@ void setup()
     pinMode(IR_PIN, INPUT);
     pinMode(BOTON_PIN, INPUT_PULLUP);
     pinMode(BUZZER_PIN, OUTPUT);
+
+    // Pines de los Touch
+    pinMode(PIN_TOUCH1, INPUT);
+    pinMode(PIN_TOUCH2, INPUT);
 
     WiFi.mode(WIFI_STA);
     if (esp_now_init() != ESP_OK)
@@ -161,6 +172,10 @@ void loop()
         noTone(BUZZER_PIN);
         notaActual = 0;
     }
+
+    // 5. ELEVADOR (Lectura de los Touch)
+    datosParaEnviar.touchPiso1 = digitalRead(PIN_TOUCH1);
+    datosParaEnviar.touchPiso2 = digitalRead(PIN_TOUCH2);
 
     esp_now_send(slaveAddress, (uint8_t *)&datosParaEnviar, sizeof(datosParaEnviar));
     delay(20);
