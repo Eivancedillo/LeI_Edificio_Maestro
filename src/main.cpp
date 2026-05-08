@@ -6,6 +6,7 @@
 #include <Adafruit_ILI9341.h>
 #include <Wire.h>
 #include <Adafruit_AHTX0.h>
+#include <TinyGPSPlus.h> // <--- LIBRERÍA GPS
 
 // --- PINES DE LA PANTALLA TFT ---
 #define TFT_CS 15
@@ -19,13 +20,20 @@
 #define LDR_PIN 34
 #define BOTON_PIN 13
 #define BUZZER_PIN 25
-#define PIN_AGUA 35 // <--- ¡NUEVO: PIN DEL SENSOR DE LLUVIA!
+#define PIN_AGUA 35
 
 // --- PINES TOUCH DEL ELEVADOR ---
 #define PIN_TOUCH1 36
 #define PIN_TOUCH2 39
 
-// --- AJUSTES GENERALES ---
+// --- PINES DEL ESTACIONAMIENTO VIP ---
+#define PIN_HALL 27
+#define RXD2 16
+#define TXD2 17
+#define RX_GSM 32
+#define TX_GSM 33
+
+// --- AJUSTES GENERALES (Pasillo, Entrada, Fiesta) ---
 const int umbralLuz = 1000;
 const int distanciaMinima = 5;
 const int distanciaMaxima = 15;
@@ -37,8 +45,8 @@ unsigned long ultimaVezDetectadoEntrada = 0;
 bool fiestaActiva = false;
 
 // --- FILTRO ANTIFANTASMAS (ULTRASONIDO) ---
-int lecturasPositivas = 0;        // Contador de veces que ha visto a alguien
-const int lecturasRequeridas = 3; // Cuántas veces seguidas debe verlo para prender
+int lecturasPositivas = 0;
+const int lecturasRequeridas = 3;
 
 // --- AJUSTES DE CLIMA (AHT20) ---
 Adafruit_AHTX0 aht;
@@ -49,7 +57,7 @@ unsigned long ultimaLecturaClima = 0;
 const int MPU = 0x68;
 int16_t AcX, AcY, AcZ;
 long baseAcX = 0, baseAcY = 0, baseAcZ = 0;
-int umbralSismo = 3000;
+int umbralSismo = 8000;
 unsigned long ultimoMilisSensor = 0;
 bool sismoActivo = false;
 int repeticionesSismo = 0;
@@ -59,34 +67,39 @@ int umbralLluvia = 500;
 unsigned long ultimoMilisAgua = 0;
 bool lluviaActiva = false;
 
-// --- MÚSICA: AXEL F (FIESTA) ---
+// --- VARIABLES DEL ESTACIONAMIENTO ---
+String numeroDestino = "+524747375924"; // <--- ¡PON TU NÚMERO AQUÍ!
+TinyGPSPlus gps;
+bool cocheEstacionado = false;
+bool mensajeEnviado = false;
+bool gsmListo = false;
+bool gpsListo = false;
+bool sistemaArmado = false;
+unsigned long ultimoMilisCheckGSM = 0;
+
+// --- REPRODUCTORES DE AUDIO (Axel F, Sismo, Lluvia) ---
 int melodiaFiesta[] = {466, 0, 523, 466, 466, 587, 466, 415, 466, 0, 698, 466, 466, 784, 698, 523, 466, 698, 932, 466, 415, 415, 349, 523, 466};
 int duracionNotas[] = {150, 50, 150, 150, 50, 150, 150, 150, 150, 50, 150, 150, 50, 150, 150, 150, 150, 150, 150, 50, 150, 50, 150, 150, 400};
 int totalNotas = 25;
 int notaActual = 0;
 unsigned long tiempoUltimaNota = 0;
 
-// --- MÚSICA: ALERTA SÍSMICA ---
 int melodiaSismo[] = {300, 325, 350, 375, 400, 425, 450, 475, 500, 525, 550, 575, 600, 625, 650, 675, 700, 725, 750, 0};
 int duracionSismo[] = {30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 400};
 int totalNotasSismo = 20;
 int notaActualSismo = 0;
 unsigned long tiempoUltimaNotaSismo = 0;
 
-// --- MÚSICA: ALERTA DE LLUVIA ---
 int melodiaLluvia[] = {1000, 0, 1200, 0};
 int duracionLluvia[] = {50, 50, 50, 1000};
 int totalNotasLluvia = 4;
 int notaActualLluvia = 0;
 unsigned long tiempoUltimaNotaLluvia = 0;
 
-// MAC del Esclavo
+// --- ESP-NOW Y PANTALLA ---
 uint8_t slaveAddress[] = {0x08, 0xD1, 0xF9, 0xD2, 0x22, 0xF4};
-
-// Objeto de la pantalla
 Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
 
-// --- DICCIONARIO ESP-NOW ---
 typedef struct struct_message
 {
     bool presenciaPasillo;
@@ -104,21 +117,22 @@ void setup()
 {
     Serial.begin(115200);
 
+    // --- SETUP DE COMUNICACIONES ESTACIONAMIENTO ---
+    Serial1.begin(9600, SERIAL_8N1, RX_GSM, TX_GSM);
+    Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
+
+    // --- SETUP DE I2C Y SENSORES ---
     Wire.begin();
-
     if (!aht.begin())
-    {
-        Serial.println("Advertencia: Sensor AHT no detectado.");
-    }
+        Serial.println("Aviso: Sensor AHT no detectado.");
 
+    // MPU-6050
     Wire.beginTransmission(MPU);
     Wire.write(0x6B);
     Wire.write(0);
     Wire.endTransmission(true);
-
-    Serial.println("Calibrando Sismo... ¡NO TOQUES LA MAQUETA!");
+    Serial.println("Calibrando Sismo... ¡NO TOQUES!");
     delay(2000);
-
     for (int i = 0; i < 100; i++)
     {
         Wire.beginTransmission(MPU);
@@ -138,9 +152,8 @@ void setup()
     baseAcX /= 100;
     baseAcY /= 100;
     baseAcZ /= 100;
-    Serial.println("Calibración Sísmica Lista.");
 
-    // --- SETUP PANTALLA ---
+    // --- SETUP DE LA PANTALLA ---
     tft.begin();
     tft.setRotation(1);
     tft.fillScreen(ILI9341_BLACK);
@@ -157,6 +170,7 @@ void setup()
     tft.setTextSize(2);
     tft.println("Sistema en Linea");
 
+    // --- PINES ---
     pinMode(TRIG_PIN, OUTPUT);
     pinMode(ECHO_PIN, INPUT);
     pinMode(IR_PIN, INPUT);
@@ -164,7 +178,7 @@ void setup()
     pinMode(BUZZER_PIN, OUTPUT);
     pinMode(PIN_TOUCH1, INPUT);
     pinMode(PIN_TOUCH2, INPUT);
-    // Pin 35 (Agua) no necesita pinMode al ser analógico puro.
+    pinMode(PIN_HALL, INPUT_PULLUP);
 
     WiFi.mode(WIFI_STA);
     if (esp_now_init() != ESP_OK)
@@ -173,13 +187,96 @@ void setup()
     peerInfo.channel = 0;
     peerInfo.encrypt = false;
     esp_now_add_peer(&peerInfo);
+
+    Serial.println("MAESTRO INICIADO: Módulos activos.");
+}
+
+void mandarAlertaLlegada()
+{
+    Serial.println("\n[!] MANDANDO SMS DEL ESTACIONAMIENTO...");
+    String linkMaps = "https://maps.google.com/?q=" + String(gps.location.lat(), 6) + "," + String(gps.location.lng(), 6);
+    String mensajeCompletito = "El coche ha llegado a la maqueta! Ubicacion: " + linkMaps;
+
+    Serial1.println("AT+CMGF=1");
+    delay(1000);
+    Serial1.print("AT+CMGS=\"");
+    Serial1.print(numeroDestino);
+    Serial1.println("\"");
+    delay(1000);
+    Serial1.print(mensajeCompletito);
+    delay(500);
+    Serial1.write(26);
+    Serial.println("✅ ALERTA ENVIADA EXITOSAMENTE.");
 }
 
 void loop()
 {
     unsigned long tiempoActual = millis();
 
-    // 1. PASILLO (Con Filtro Antifantasmas)
+    // ==========================================
+    // MÓDULO 0: ALIMENTAR AL GPS Y GSM (Asíncrono)
+    // ==========================================
+    while (Serial2.available() > 0)
+    {
+        gps.encode(Serial2.read());
+    }
+
+    if (!sistemaArmado)
+    {
+        // Verificar GSM cada 3 segundos sin pausar el edificio
+        if (!gsmListo && (tiempoActual - ultimoMilisCheckGSM >= 3000))
+        {
+            ultimoMilisCheckGSM = tiempoActual;
+            Serial1.println("AT+CREG?");
+            String respuesta = "";
+            while (Serial1.available())
+                respuesta += (char)Serial1.read();
+
+            if (respuesta.indexOf("0,1") != -1 || respuesta.indexOf("0,5") != -1)
+            {
+                gsmListo = true;
+                Serial.println("✅ Red Celular GSM Lista.");
+            }
+        }
+        // Si hay GSM, verificar si ya hay GPS
+        if (gsmListo && !gpsListo)
+        {
+            if (gps.location.isValid())
+            {
+                gpsListo = true;
+                sistemaArmado = true;
+                Serial.println("✅ Coordenadas GPS Listas. ESTACIONAMIENTO ARMADO Y ACTIVO.");
+            }
+        }
+    }
+
+    // ==========================================
+    // MÓDULO 1: ESTACIONAMIENTO (Efecto Hall)
+    // ==========================================
+    if (sistemaArmado)
+    {
+        int estadoHall = digitalRead(PIN_HALL);
+        if (estadoHall == LOW)
+        {
+            cocheEstacionado = true;
+        }
+        else
+        {
+            cocheEstacionado = false;
+            mensajeEnviado = false;
+        }
+
+        if (cocheEstacionado && !mensajeEnviado)
+        {
+            Serial.println("🧲 ¡Coche en el estacionamiento!");
+            mandarAlertaLlegada();
+            mensajeEnviado = true;
+        }
+    }
+
+    // ==========================================
+    // MÓDULO 2: PASILLO (Ultrasonido Antifantasmas)
+    // ==========================================
     digitalWrite(TRIG_PIN, LOW);
     delayMicroseconds(2);
     digitalWrite(TRIG_PIN, HIGH);
@@ -187,35 +284,27 @@ void loop()
     digitalWrite(TRIG_PIN, LOW);
     int distancia = (pulseIn(ECHO_PIN, HIGH)) * 0.034 / 2;
 
-    // Si la lectura marca cero o un número loquísimo (ej. 3000), es ruido eléctrico puro.
     if (distancia == 0 || distancia > 400)
-    {
-        distancia = 999; // Forzamos a ignorarlo
-    }
+        distancia = 999;
 
     if (distancia >= distanciaMinima && distancia <= distanciaMaxima)
     {
-        // Vio algo, sumamos un punto al contador
         lecturasPositivas++;
-
-        // Si ya lo vio 3 veces seguidas (aprox 60ms), es real
         if (lecturasPositivas >= lecturasRequeridas)
         {
             ultimaVezDetectadoPasillo = tiempoActual;
             datosParaEnviar.presenciaPasillo = true;
-            // No reseteamos el contador para que siga detectando mientras la persona esté ahí
         }
     }
     else
     {
-        // Si de repente dejó de ver el obstáculo, reseteamos el contador
         lecturasPositivas = 0;
-
-        // Mantenemos las luces prendidas por el tiempo de espera (3 segundos)
         datosParaEnviar.presenciaPasillo = (tiempoActual - ultimaVezDetectadoPasillo < tiempoEsperaLeds);
     }
 
-    // 2. ENTRADA
+    // ==========================================
+    // MÓDULO 3: ENTRADA (IR) Y FIESTA (LDR/Botón)
+    // ==========================================
     if (digitalRead(IR_PIN) == LOW)
     {
         ultimaVezDetectadoEntrada = tiempoActual;
@@ -226,40 +315,30 @@ void loop()
         datosParaEnviar.presenciaEntrada = (tiempoActual - ultimaVezDetectadoEntrada < tiempoEsperaEntrada);
     }
 
-    // 3. FIESTA
     int valorLuz = analogRead(LDR_PIN);
     if (valorLuz > umbralLuz)
-    {
         fiestaActiva = false;
-    }
     else if (digitalRead(BOTON_PIN) == LOW)
-    {
         fiestaActiva = true;
-    }
     datosParaEnviar.fiestaActiva = fiestaActiva;
 
-    // 4. ELEVADOR
+    // ==========================================
+    // MÓDULO 4: ELEVADOR Y CLIMA
+    // ==========================================
     datosParaEnviar.touchPiso1 = digitalRead(PIN_TOUCH1);
     datosParaEnviar.touchPiso2 = digitalRead(PIN_TOUCH2);
 
-    // 5. CLIMA
     if (tiempoActual - ultimaLecturaClima >= 2000)
     {
         sensors_event_t humedad, temperatura;
         aht.getEvent(&humedad, &temperatura);
-
-        if (temperatura.temperature >= tempUmbral)
-        {
-            datosParaEnviar.ventiladorActivo = true;
-        }
-        else
-        {
-            datosParaEnviar.ventiladorActivo = false;
-        }
+        datosParaEnviar.ventiladorActivo = (temperatura.temperature >= tempUmbral);
         ultimaLecturaClima = tiempoActual;
     }
 
-    // 6. SISMO (Cada 50ms)
+    // ==========================================
+    // MÓDULO 5: SISMO Y LLUVIA
+    // ==========================================
     if (tiempoActual - ultimoMilisSensor >= 50)
     {
         ultimoMilisSensor = tiempoActual;
@@ -267,11 +346,9 @@ void loop()
         Wire.write(0x3B);
         Wire.endTransmission(false);
         Wire.requestFrom(MPU, 6, true);
-
         AcX = Wire.read() << 8 | Wire.read();
         AcY = Wire.read() << 8 | Wire.read();
         AcZ = Wire.read() << 8 | Wire.read();
-
         long difX = (long)AcX - baseAcX;
         if (difX < 0)
             difX = -difX;
@@ -291,12 +368,10 @@ void loop()
         }
     }
 
-    // 7. LLUVIA (Cada 500ms)
     if (tiempoActual - ultimoMilisAgua >= 500)
     {
         int lecturaAgua = analogRead(PIN_AGUA);
         ultimoMilisAgua = tiempoActual;
-
         if (lecturaAgua > umbralLluvia)
         {
             if (!lluviaActiva)
@@ -312,20 +387,20 @@ void loop()
         }
     }
 
-    // 8. CONTROL MAESTRO DE AUDIO (Jerarquía)
+    // ==========================================
+    // MÓDULO 6: JERARQUÍA DE AUDIO
+    // ==========================================
+    static bool buzzerSonando = false; // Candado para no saturar el LEDC
+
     if (sismoActivo)
     {
-        // PRIORIDAD 1: SISMO
+        buzzerSonando = true;
         if (tiempoActual - tiempoUltimaNotaSismo >= duracionSismo[notaActualSismo])
         {
             if (melodiaSismo[notaActualSismo] > 0)
-            {
                 tone(BUZZER_PIN, melodiaSismo[notaActualSismo], duracionSismo[notaActualSismo] - 5);
-            }
             else
-            {
                 noTone(BUZZER_PIN);
-            }
             notaActualSismo++;
             if (notaActualSismo >= totalNotasSismo)
             {
@@ -334,8 +409,8 @@ void loop()
                 if (repeticionesSismo >= 4)
                 {
                     sismoActivo = false;
-                    notaActual = 0;       // Reset fiesta
-                    notaActualLluvia = 0; // Reset lluvia
+                    notaActual = 0;
+                    notaActualLluvia = 0;
                 }
             }
             tiempoUltimaNotaSismo = tiempoActual;
@@ -343,38 +418,28 @@ void loop()
     }
     else if (lluviaActiva)
     {
-        // PRIORIDAD 2: LLUVIA
+        buzzerSonando = true;
         if (tiempoActual - tiempoUltimaNotaLluvia >= duracionLluvia[notaActualLluvia])
         {
             if (melodiaLluvia[notaActualLluvia] > 0)
-            {
                 tone(BUZZER_PIN, melodiaLluvia[notaActualLluvia], duracionLluvia[notaActualLluvia] - 5);
-            }
             else
-            {
                 noTone(BUZZER_PIN);
-            }
             notaActualLluvia++;
             if (notaActualLluvia >= totalNotasLluvia)
-            {
                 notaActualLluvia = 0;
-            }
             tiempoUltimaNotaLluvia = tiempoActual;
         }
     }
     else if (fiestaActiva)
     {
-        // PRIORIDAD 3: FIESTA (Axel F)
+        buzzerSonando = true;
         if (tiempoActual - tiempoUltimaNota >= duracionNotas[notaActual])
         {
             if (melodiaFiesta[notaActual] > 0)
-            {
                 tone(BUZZER_PIN, melodiaFiesta[notaActual], duracionNotas[notaActual] - 20);
-            }
             else
-            {
                 noTone(BUZZER_PIN);
-            }
             notaActual++;
             if (notaActual >= totalNotas)
                 notaActual = 0;
@@ -383,14 +448,20 @@ void loop()
     }
     else
     {
-        // SILENCIO TOTAL
-        noTone(BUZZER_PIN);
+        // AQUÍ ESTÁ LA MAGIA: Solo mandamos "noTone" si realmente estaba sonando
+        if (buzzerSonando)
+        {
+            noTone(BUZZER_PIN);
+            buzzerSonando = false;
+        }
         notaActual = 0;
         notaActualSismo = 0;
         notaActualLluvia = 0;
     }
 
-    // 9. ENVIAR DATOS AL ESCLAVO
+    // ==========================================
+    // MÓDULO 7: ENVÍO AL ESCLAVO
+    // ==========================================
     esp_now_send(slaveAddress, (uint8_t *)&datosParaEnviar, sizeof(datosParaEnviar));
     delay(20);
 }
