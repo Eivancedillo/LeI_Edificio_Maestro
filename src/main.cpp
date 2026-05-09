@@ -6,7 +6,7 @@
 #include <Adafruit_ILI9341.h>
 #include <Wire.h>
 #include <Adafruit_AHTX0.h>
-#include <TinyGPSPlus.h> // <--- LIBRERÍA GPS
+#include <TinyGPSPlus.h>
 
 // --- PINES DE LA PANTALLA TFT ---
 #define TFT_CS 15
@@ -21,6 +21,7 @@
 #define BOTON_PIN 13
 #define BUZZER_PIN 25
 #define PIN_AGUA 35
+#define PIN_IR_PLUMA 26 // <--- SENSOR DE LA PLUMA
 
 // --- PINES TOUCH DEL ELEVADOR ---
 #define PIN_TOUCH1 36
@@ -33,27 +34,29 @@
 #define RX_GSM 32
 #define TX_GSM 33
 
-// --- AJUSTES GENERALES (Pasillo, Entrada, Fiesta) ---
+// --- AJUSTES GENERALES ---
 const int umbralLuz = 1000;
 const int distanciaMinima = 5;
 const int distanciaMaxima = 15;
 const unsigned long tiempoEsperaLeds = 3000;
 const unsigned long tiempoEsperaEntrada = 3000;
+unsigned long millisPluma = 0;
+const unsigned long TIEMPO_ESPERA_PLUMA = 3000;
 
 unsigned long ultimaVezDetectadoPasillo = 0;
 unsigned long ultimaVezDetectadoEntrada = 0;
 bool fiestaActiva = false;
 
-// --- FILTRO ANTIFANTASMAS (ULTRASONIDO) ---
+// --- FILTRO ANTIFANTASMAS ---
 int lecturasPositivas = 0;
 const int lecturasRequeridas = 3;
 
-// --- AJUSTES DE CLIMA (AHT20) ---
+// --- AJUSTES DE CLIMA ---
 Adafruit_AHTX0 aht;
 float tempUmbral = 30.0;
 unsigned long ultimaLecturaClima = 0;
 
-// --- AJUSTES DE SISMO (MPU-6050) ---
+// --- AJUSTES DE SISMO ---
 const int MPU = 0x68;
 int16_t AcX, AcY, AcZ;
 long baseAcX = 0, baseAcY = 0, baseAcZ = 0;
@@ -68,7 +71,7 @@ unsigned long ultimoMilisAgua = 0;
 bool lluviaActiva = false;
 
 // --- VARIABLES DEL ESTACIONAMIENTO ---
-String numeroDestino = "+524747375924"; // <--- ¡PON TU NÚMERO AQUÍ!
+String numeroDestino = "+524747375924"; // <--- TU NÚMERO
 TinyGPSPlus gps;
 bool cocheEstacionado = false;
 bool mensajeEnviado = false;
@@ -77,7 +80,7 @@ bool gpsListo = false;
 bool sistemaArmado = false;
 unsigned long ultimoMilisCheckGSM = 0;
 
-// --- REPRODUCTORES DE AUDIO (Axel F, Sismo, Lluvia) ---
+// --- AUDIO ---
 int melodiaFiesta[] = {466, 0, 523, 466, 466, 587, 466, 415, 466, 0, 698, 466, 466, 784, 698, 523, 466, 698, 932, 466, 415, 415, 349, 523, 466};
 int duracionNotas[] = {150, 50, 150, 150, 50, 150, 150, 150, 150, 50, 150, 150, 50, 150, 150, 150, 150, 150, 150, 50, 150, 50, 150, 150, 400};
 int totalNotas = 25;
@@ -108,6 +111,7 @@ typedef struct struct_message
     bool touchPiso1;
     bool touchPiso2;
     bool ventiladorActivo;
+    bool abrirPluma; // <--- LA ORDEN PARA EL ESCLAVO
 } struct_message;
 
 struct_message datosParaEnviar;
@@ -117,16 +121,13 @@ void setup()
 {
     Serial.begin(115200);
 
-    // --- SETUP DE COMUNICACIONES ESTACIONAMIENTO ---
     Serial1.begin(9600, SERIAL_8N1, RX_GSM, TX_GSM);
     Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
 
-    // --- SETUP DE I2C Y SENSORES ---
     Wire.begin();
     if (!aht.begin())
         Serial.println("Aviso: Sensor AHT no detectado.");
 
-    // MPU-6050
     Wire.beginTransmission(MPU);
     Wire.write(0x6B);
     Wire.write(0);
@@ -139,11 +140,9 @@ void setup()
         Wire.write(0x3B);
         Wire.endTransmission(false);
         Wire.requestFrom(MPU, 6, true);
-
         int16_t tempX = Wire.read() << 8 | Wire.read();
         int16_t tempY = Wire.read() << 8 | Wire.read();
         int16_t tempZ = Wire.read() << 8 | Wire.read();
-
         baseAcX += tempX;
         baseAcY += tempY;
         baseAcZ += tempZ;
@@ -153,7 +152,6 @@ void setup()
     baseAcY /= 100;
     baseAcZ /= 100;
 
-    // --- SETUP DE LA PANTALLA ---
     tft.begin();
     tft.setRotation(1);
     tft.fillScreen(ILI9341_BLACK);
@@ -170,7 +168,6 @@ void setup()
     tft.setTextSize(2);
     tft.println("Sistema en Linea");
 
-    // --- PINES ---
     pinMode(TRIG_PIN, OUTPUT);
     pinMode(ECHO_PIN, INPUT);
     pinMode(IR_PIN, INPUT);
@@ -179,6 +176,7 @@ void setup()
     pinMode(PIN_TOUCH1, INPUT);
     pinMode(PIN_TOUCH2, INPUT);
     pinMode(PIN_HALL, INPUT_PULLUP);
+    pinMode(PIN_IR_PLUMA, INPUT); // <--- INICIALIZAMOS EL SENSOR DE LA PLUMA
 
     WiFi.mode(WIFI_STA);
     if (esp_now_init() != ESP_OK)
@@ -213,17 +211,12 @@ void loop()
 {
     unsigned long tiempoActual = millis();
 
-    // ==========================================
-    // MÓDULO 0: ALIMENTAR AL GPS Y GSM (Asíncrono)
-    // ==========================================
+    // MÓDULO 0: GPS Y GSM
     while (Serial2.available() > 0)
-    {
         gps.encode(Serial2.read());
-    }
 
     if (!sistemaArmado)
     {
-        // Verificar GSM cada 3 segundos sin pausar el edificio
         if (!gsmListo && (tiempoActual - ultimoMilisCheckGSM >= 3000))
         {
             ultimoMilisCheckGSM = tiempoActual;
@@ -231,14 +224,12 @@ void loop()
             String respuesta = "";
             while (Serial1.available())
                 respuesta += (char)Serial1.read();
-
             if (respuesta.indexOf("0,1") != -1 || respuesta.indexOf("0,5") != -1)
             {
                 gsmListo = true;
                 Serial.println("✅ Red Celular GSM Lista.");
             }
         }
-        // Si hay GSM, verificar si ya hay GPS
         if (gsmListo && !gpsListo)
         {
             if (gps.location.isValid())
@@ -250,16 +241,12 @@ void loop()
         }
     }
 
-    // ==========================================
-    // MÓDULO 1: ESTACIONAMIENTO (Efecto Hall)
-    // ==========================================
+    // MÓDULO 1: ESTACIONAMIENTO (Hall)
     if (sistemaArmado)
     {
         int estadoHall = digitalRead(PIN_HALL);
         if (estadoHall == LOW)
-        {
             cocheEstacionado = true;
-        }
         else
         {
             cocheEstacionado = false;
@@ -274,16 +261,13 @@ void loop()
         }
     }
 
-    // ==========================================
-    // MÓDULO 2: PASILLO (Ultrasonido Antifantasmas)
-    // ==========================================
+    // MÓDULO 2: PASILLO
     digitalWrite(TRIG_PIN, LOW);
     delayMicroseconds(2);
     digitalWrite(TRIG_PIN, HIGH);
     delayMicroseconds(10);
     digitalWrite(TRIG_PIN, LOW);
     int distancia = (pulseIn(ECHO_PIN, HIGH)) * 0.034 / 2;
-
     if (distancia == 0 || distancia > 400)
         distancia = 999;
 
@@ -302,9 +286,7 @@ void loop()
         datosParaEnviar.presenciaPasillo = (tiempoActual - ultimaVezDetectadoPasillo < tiempoEsperaLeds);
     }
 
-    // ==========================================
-    // MÓDULO 3: ENTRADA (IR) Y FIESTA (LDR/Botón)
-    // ==========================================
+    // MÓDULO 3: ENTRADA Y FIESTA
     if (digitalRead(IR_PIN) == LOW)
     {
         ultimaVezDetectadoEntrada = tiempoActual;
@@ -322,12 +304,9 @@ void loop()
         fiestaActiva = true;
     datosParaEnviar.fiestaActiva = fiestaActiva;
 
-    // ==========================================
     // MÓDULO 4: ELEVADOR Y CLIMA
-    // ==========================================
     datosParaEnviar.touchPiso1 = digitalRead(PIN_TOUCH1);
     datosParaEnviar.touchPiso2 = digitalRead(PIN_TOUCH2);
-
     if (tiempoActual - ultimaLecturaClima >= 2000)
     {
         sensors_event_t humedad, temperatura;
@@ -336,9 +315,7 @@ void loop()
         ultimaLecturaClima = tiempoActual;
     }
 
-    // ==========================================
     // MÓDULO 5: SISMO Y LLUVIA
-    // ==========================================
     if (tiempoActual - ultimoMilisSensor >= 50)
     {
         ultimoMilisSensor = tiempoActual;
@@ -349,16 +326,9 @@ void loop()
         AcX = Wire.read() << 8 | Wire.read();
         AcY = Wire.read() << 8 | Wire.read();
         AcZ = Wire.read() << 8 | Wire.read();
-        long difX = (long)AcX - baseAcX;
-        if (difX < 0)
-            difX = -difX;
-        long difY = (long)AcY - baseAcY;
-        if (difY < 0)
-            difY = -difY;
-        long difZ = (long)AcZ - baseAcZ;
-        if (difZ < 0)
-            difZ = -difZ;
-
+        long difX = abs((long)AcX - baseAcX);
+        long difY = abs((long)AcY - baseAcY);
+        long difZ = abs((long)AcZ - baseAcZ);
         if ((difX > umbralSismo || difY > umbralSismo || difZ > umbralSismo) && !sismoActivo)
         {
             sismoActivo = true;
@@ -387,11 +357,8 @@ void loop()
         }
     }
 
-    // ==========================================
-    // MÓDULO 6: JERARQUÍA DE AUDIO
-    // ==========================================
-    static bool buzzerSonando = false; // Candado para no saturar el LEDC
-
+    // MÓDULO 6: AUDIO
+    static bool buzzerSonando = false;
     if (sismoActivo)
     {
         buzzerSonando = true;
@@ -448,7 +415,6 @@ void loop()
     }
     else
     {
-        // AQUÍ ESTÁ LA MAGIA: Solo mandamos "noTone" si realmente estaba sonando
         if (buzzerSonando)
         {
             noTone(BUZZER_PIN);
@@ -459,9 +425,21 @@ void loop()
         notaActualLluvia = 0;
     }
 
-    // ==========================================
-    // MÓDULO 7: ENVÍO AL ESCLAVO
-    // ==========================================
+    // MÓDULO 7: PLUMA (Lógica de abrir/cerrar)
+    if (digitalRead(PIN_IR_PLUMA) == LOW)
+    {
+        datosParaEnviar.abrirPluma = true;
+        millisPluma = tiempoActual;
+    }
+    else
+    {
+        if (datosParaEnviar.abrirPluma && (tiempoActual - millisPluma >= TIEMPO_ESPERA_PLUMA))
+        {
+            datosParaEnviar.abrirPluma = false;
+        }
+    }
+
+    // MÓDULO 8: ENVÍO AL ESCLAVO
     esp_now_send(slaveAddress, (uint8_t *)&datosParaEnviar, sizeof(datosParaEnviar));
     delay(20);
 }
