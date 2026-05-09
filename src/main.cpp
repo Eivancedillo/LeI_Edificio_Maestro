@@ -21,7 +21,7 @@
 #define BOTON_PIN 13
 #define BUZZER_PIN 25
 #define PIN_AGUA 35
-#define PIN_IR_PLUMA 26 // <--- SENSOR DE LA PLUMA
+#define PIN_IR_PLUMA 26
 
 // --- PINES TOUCH DEL ELEVADOR ---
 #define PIN_TOUCH1 36
@@ -54,6 +54,7 @@ const int lecturasRequeridas = 3;
 // --- AJUSTES DE CLIMA ---
 Adafruit_AHTX0 aht;
 float tempUmbral = 30.0;
+float tempActual = 0.0;
 unsigned long ultimaLecturaClima = 0;
 
 // --- AJUSTES DE SISMO ---
@@ -71,7 +72,7 @@ unsigned long ultimoMilisAgua = 0;
 bool lluviaActiva = false;
 
 // --- VARIABLES DEL ESTACIONAMIENTO ---
-String numeroDestino = "+524747375924"; // <--- TU NÚMERO
+String numeroDestino = "+524747375924";
 TinyGPSPlus gps;
 bool cocheEstacionado = false;
 bool mensajeEnviado = false;
@@ -111,11 +112,44 @@ typedef struct struct_message
     bool touchPiso1;
     bool touchPiso2;
     bool ventiladorActivo;
-    bool abrirPluma; // <--- LA ORDEN PARA EL ESCLAVO
+    bool abrirPluma;
 } struct_message;
 
 struct_message datosParaEnviar;
 esp_now_peer_info_t peerInfo;
+
+// --- GEMELO DIGITAL DEL ELEVADOR (NUEVO) ---
+bool sim_elevadorEnPiso1 = true;
+bool sim_elevadorEnViaje = false;
+bool sim_esperando = false;
+unsigned long sim_tiempoApertura = 0;
+unsigned long sim_tiempoViaje = 0;
+const unsigned long TIEMPO_ESPERA_ELEVADOR = 3000;
+const unsigned long TIEMPO_TRAYECTO = 7000; // <--- Cambia esto a los segundos reales que tarda tu motor en subir
+
+// --- MEMORIA DE LA PANTALLA TFT ---
+bool tft_sismo = false;
+bool tft_lluvia = false;
+bool tft_pasillo = false;
+bool tft_entrada = false;
+bool tft_fiesta = false;
+bool tft_pluma = false;
+bool tft_coche = false;
+float tft_temp = -100.0;
+int tft_estadoSenal = -1;
+int tft_elevador = -1;
+
+void actualizarFilaTFT(int y, String nombre, String estado, uint16_t colorEstado)
+{
+    tft.setTextSize(2);
+    tft.fillRect(130, y, 190, 16, ILI9341_BLACK);
+    tft.setCursor(10, y);
+    tft.setTextColor(ILI9341_WHITE);
+    tft.print(nombre);
+    tft.setCursor(130, y);
+    tft.setTextColor(colorEstado);
+    tft.print(estado);
+}
 
 void setup()
 {
@@ -132,7 +166,6 @@ void setup()
     Wire.write(0x6B);
     Wire.write(0);
     Wire.endTransmission(true);
-    Serial.println("Calibrando Sismo... ¡NO TOQUES!");
     delay(2000);
     for (int i = 0; i < 100; i++)
     {
@@ -152,21 +185,27 @@ void setup()
     baseAcY /= 100;
     baseAcZ /= 100;
 
+    // --- DISEÑO DE PANTALLA AJUSTADO PARA 10 RENGLONES ---
     tft.begin();
     tft.setRotation(1);
     tft.fillScreen(ILI9341_BLACK);
-    tft.setCursor(10, 30);
-    tft.setTextColor(ILI9341_GREEN);
-    tft.setTextSize(3);
-    tft.println("Edificio inteligente");
-    tft.setCursor(10, 65);
-    tft.setTextColor(ILI9341_CYAN);
-    tft.setTextSize(1);
-    tft.println("Lenguajes e Interdaces");
-    tft.setCursor(10, 100);
+
+    tft.fillRect(0, 0, 320, 26, ILI9341_NAVY);
+    tft.setCursor(20, 5);
     tft.setTextColor(ILI9341_WHITE);
     tft.setTextSize(2);
-    tft.println("Sistema en Linea");
+    tft.println("PANEL TECNM LAGOS");
+
+    actualizarFilaTFT(34, "Senal:", "BUSCANDO RED", ILI9341_ORANGE);
+    actualizarFilaTFT(54, "Sismo:", "SEGURO", ILI9341_GREEN);
+    actualizarFilaTFT(74, "Lluvia:", "DESPEJADO", ILI9341_GREEN);
+    actualizarFilaTFT(94, "Clima:", "Calculando...", ILI9341_CYAN);
+    actualizarFilaTFT(114, "Pasillo:", "VACIO", ILI9341_GREEN);
+    actualizarFilaTFT(134, "Puertas:", "CERRADAS", ILI9341_GREEN);
+    actualizarFilaTFT(154, "Pluma:", "ABAJO", ILI9341_GREEN);
+    actualizarFilaTFT(174, "Parking:", "LIBRE", ILI9341_GREEN);
+    actualizarFilaTFT(194, "Fiesta:", "OFF", ILI9341_LIGHTGREY);
+    actualizarFilaTFT(214, "Elevador:", "PISO 1 (OFF)", ILI9341_LIGHTGREY);
 
     pinMode(TRIG_PIN, OUTPUT);
     pinMode(ECHO_PIN, INPUT);
@@ -176,7 +215,7 @@ void setup()
     pinMode(PIN_TOUCH1, INPUT);
     pinMode(PIN_TOUCH2, INPUT);
     pinMode(PIN_HALL, INPUT_PULLUP);
-    pinMode(PIN_IR_PLUMA, INPUT); // <--- INICIALIZAMOS EL SENSOR DE LA PLUMA
+    pinMode(PIN_IR_PLUMA, INPUT);
 
     WiFi.mode(WIFI_STA);
     if (esp_now_init() != ESP_OK)
@@ -185,16 +224,12 @@ void setup()
     peerInfo.channel = 0;
     peerInfo.encrypt = false;
     esp_now_add_peer(&peerInfo);
-
-    Serial.println("MAESTRO INICIADO: Módulos activos.");
 }
 
 void mandarAlertaLlegada()
 {
-    Serial.println("\n[!] MANDANDO SMS DEL ESTACIONAMIENTO...");
     String linkMaps = "https://maps.google.com/?q=" + String(gps.location.lat(), 6) + "," + String(gps.location.lng(), 6);
     String mensajeCompletito = "El coche ha llegado a la maqueta! Ubicacion: " + linkMaps;
-
     Serial1.println("AT+CMGF=1");
     delay(1000);
     Serial1.print("AT+CMGS=\"");
@@ -204,14 +239,12 @@ void mandarAlertaLlegada()
     Serial1.print(mensajeCompletito);
     delay(500);
     Serial1.write(26);
-    Serial.println("✅ ALERTA ENVIADA EXITOSAMENTE.");
 }
 
 void loop()
 {
     unsigned long tiempoActual = millis();
 
-    // MÓDULO 0: GPS Y GSM
     while (Serial2.available() > 0)
         gps.encode(Serial2.read());
 
@@ -225,10 +258,7 @@ void loop()
             while (Serial1.available())
                 respuesta += (char)Serial1.read();
             if (respuesta.indexOf("0,1") != -1 || respuesta.indexOf("0,5") != -1)
-            {
                 gsmListo = true;
-                Serial.println("✅ Red Celular GSM Lista.");
-            }
         }
         if (gsmListo && !gpsListo)
         {
@@ -236,32 +266,26 @@ void loop()
             {
                 gpsListo = true;
                 sistemaArmado = true;
-                Serial.println("✅ Coordenadas GPS Listas. ESTACIONAMIENTO ARMADO Y ACTIVO.");
             }
         }
     }
 
-    // MÓDULO 1: ESTACIONAMIENTO (Hall)
     if (sistemaArmado)
     {
-        int estadoHall = digitalRead(PIN_HALL);
-        if (estadoHall == LOW)
+        if (digitalRead(PIN_HALL) == LOW)
             cocheEstacionado = true;
         else
         {
             cocheEstacionado = false;
             mensajeEnviado = false;
         }
-
         if (cocheEstacionado && !mensajeEnviado)
         {
-            Serial.println("🧲 ¡Coche en el estacionamiento!");
             mandarAlertaLlegada();
             mensajeEnviado = true;
         }
     }
 
-    // MÓDULO 2: PASILLO
     digitalWrite(TRIG_PIN, LOW);
     delayMicroseconds(2);
     digitalWrite(TRIG_PIN, HIGH);
@@ -286,7 +310,6 @@ void loop()
         datosParaEnviar.presenciaPasillo = (tiempoActual - ultimaVezDetectadoPasillo < tiempoEsperaLeds);
     }
 
-    // MÓDULO 3: ENTRADA Y FIESTA
     if (digitalRead(IR_PIN) == LOW)
     {
         ultimaVezDetectadoEntrada = tiempoActual;
@@ -304,18 +327,41 @@ void loop()
         fiestaActiva = true;
     datosParaEnviar.fiestaActiva = fiestaActiva;
 
-    // MÓDULO 4: ELEVADOR Y CLIMA
     datosParaEnviar.touchPiso1 = digitalRead(PIN_TOUCH1);
     datosParaEnviar.touchPiso2 = digitalRead(PIN_TOUCH2);
+
+    // ==========================================
+    // GEMELO DIGITAL: SIMULACIÓN DE ELEVADOR
+    // ==========================================
+    if (!sim_elevadorEnViaje && !sim_esperando)
+    {
+        if (datosParaEnviar.touchPiso1 || datosParaEnviar.touchPiso2)
+        {
+            sim_esperando = true;
+            sim_tiempoApertura = tiempoActual;
+        }
+    }
+    if (sim_esperando && (tiempoActual - sim_tiempoApertura >= TIEMPO_ESPERA_ELEVADOR))
+    {
+        sim_esperando = false;
+        sim_elevadorEnViaje = true;
+        sim_tiempoViaje = tiempoActual;
+    }
+    if (sim_elevadorEnViaje && (tiempoActual - sim_tiempoViaje >= TIEMPO_TRAYECTO))
+    {
+        sim_elevadorEnViaje = false;
+        sim_elevadorEnPiso1 = !sim_elevadorEnPiso1;
+    }
+
     if (tiempoActual - ultimaLecturaClima >= 2000)
     {
-        sensors_event_t humedad, temperatura;
-        aht.getEvent(&humedad, &temperatura);
-        datosParaEnviar.ventiladorActivo = (temperatura.temperature >= tempUmbral);
+        sensors_event_t humedad, temperaturaAHT;
+        aht.getEvent(&humedad, &temperaturaAHT);
+        tempActual = temperaturaAHT.temperature;
+        datosParaEnviar.ventiladorActivo = (tempActual >= tempUmbral);
         ultimaLecturaClima = tiempoActual;
     }
 
-    // MÓDULO 5: SISMO Y LLUVIA
     if (tiempoActual - ultimoMilisSensor >= 50)
     {
         ultimoMilisSensor = tiempoActual;
@@ -357,7 +403,6 @@ void loop()
         }
     }
 
-    // MÓDULO 6: AUDIO
     static bool buzzerSonando = false;
     if (sismoActivo)
     {
@@ -425,7 +470,6 @@ void loop()
         notaActualLluvia = 0;
     }
 
-    // MÓDULO 7: PLUMA (Lógica de abrir/cerrar)
     if (digitalRead(PIN_IR_PLUMA) == LOW)
     {
         datosParaEnviar.abrirPluma = true;
@@ -434,12 +478,115 @@ void loop()
     else
     {
         if (datosParaEnviar.abrirPluma && (tiempoActual - millisPluma >= TIEMPO_ESPERA_PLUMA))
-        {
             datosParaEnviar.abrirPluma = false;
-        }
     }
 
-    // MÓDULO 8: ENVÍO AL ESCLAVO
+    // ==========================================
+    // ACTUALIZACIÓN DE PANTALLA TFT
+    // ==========================================
+    int estadoActualSenal = 0;
+    if (sistemaArmado)
+        estadoActualSenal = 2;
+    else if (gsmListo)
+        estadoActualSenal = 1;
+
+    if (estadoActualSenal != tft_estadoSenal)
+    {
+        tft_estadoSenal = estadoActualSenal;
+        if (estadoActualSenal == 0)
+            actualizarFilaTFT(34, "Senal:", "BUSCANDO RED", ILI9341_ORANGE);
+        else if (estadoActualSenal == 1)
+            actualizarFilaTFT(34, "Senal:", "BUSCANDO GPS", ILI9341_YELLOW);
+        else if (estadoActualSenal == 2)
+            actualizarFilaTFT(34, "Senal:", "EN LINEA", ILI9341_GREEN);
+    }
+
+    if (sismoActivo != tft_sismo)
+    {
+        tft_sismo = sismoActivo;
+        if (sismoActivo)
+            actualizarFilaTFT(54, "Sismo:", "PELIGRO!!", ILI9341_RED);
+        else
+            actualizarFilaTFT(54, "Sismo:", "SEGURO", ILI9341_GREEN);
+    }
+    if (lluviaActiva != tft_lluvia)
+    {
+        tft_lluvia = lluviaActiva;
+        if (lluviaActiva)
+            actualizarFilaTFT(74, "Lluvia:", "LLOVIENDO", ILI9341_BLUE);
+        else
+            actualizarFilaTFT(74, "Lluvia:", "DESPEJADO", ILI9341_GREEN);
+    }
+
+    if (abs(tempActual - tft_temp) >= 0.5 && tempActual > 0)
+    {
+        tft_temp = tempActual;
+        String textoTemp = String(tft_temp, 1) + "C";
+        if (datosParaEnviar.ventiladorActivo)
+            actualizarFilaTFT(94, "Clima:", textoTemp + " (V:ON)", ILI9341_ORANGE);
+        else
+            actualizarFilaTFT(94, "Clima:", textoTemp + " (V:OFF)", ILI9341_CYAN);
+    }
+
+    if (datosParaEnviar.presenciaPasillo != tft_pasillo)
+    {
+        tft_pasillo = datosParaEnviar.presenciaPasillo;
+        if (tft_pasillo)
+            actualizarFilaTFT(114, "Pasillo:", "DETECTADO", ILI9341_RED);
+        else
+            actualizarFilaTFT(114, "Pasillo:", "VACIO", ILI9341_GREEN);
+    }
+    if (datosParaEnviar.presenciaEntrada != tft_entrada)
+    {
+        tft_entrada = datosParaEnviar.presenciaEntrada;
+        if (tft_entrada)
+            actualizarFilaTFT(134, "Puertas:", "ABIERTAS", ILI9341_YELLOW);
+        else
+            actualizarFilaTFT(134, "Puertas:", "CERRADAS", ILI9341_GREEN);
+    }
+    if (datosParaEnviar.abrirPluma != tft_pluma)
+    {
+        tft_pluma = datosParaEnviar.abrirPluma;
+        if (tft_pluma)
+            actualizarFilaTFT(154, "Pluma:", "ARRIBA", ILI9341_YELLOW);
+        else
+            actualizarFilaTFT(154, "Pluma:", "ABAJO", ILI9341_GREEN);
+    }
+    if (cocheEstacionado != tft_coche)
+    {
+        tft_coche = cocheEstacionado;
+        if (tft_coche)
+            actualizarFilaTFT(174, "Parking:", "OCUPADO", ILI9341_RED);
+        else
+            actualizarFilaTFT(174, "Parking:", "LIBRE", ILI9341_GREEN);
+    }
+    if (fiestaActiva != tft_fiesta)
+    {
+        tft_fiesta = fiestaActiva;
+        if (tft_fiesta)
+            actualizarFilaTFT(194, "Fiesta:", "ON", ILI9341_MAGENTA);
+        else
+            actualizarFilaTFT(194, "Fiesta:", "OFF", ILI9341_LIGHTGREY);
+    }
+
+    // DIBUJAR ELEVADOR
+    int estadoElevador = 0; // 0=Piso1, 1=Viaje, 2=Piso2
+    if (sim_elevadorEnViaje)
+        estadoElevador = 1;
+    else if (!sim_elevadorEnPiso1)
+        estadoElevador = 2;
+
+    if (estadoElevador != tft_elevador)
+    {
+        tft_elevador = estadoElevador;
+        if (estadoElevador == 0)
+            actualizarFilaTFT(214, "Elevador:", "PISO 1 (OFF)", ILI9341_LIGHTGREY);
+        else if (estadoElevador == 1)
+            actualizarFilaTFT(214, "Elevador:", "MOVIENDO...", ILI9341_YELLOW);
+        else if (estadoElevador == 2)
+            actualizarFilaTFT(214, "Elevador:", "PISO 2 (ON)", ILI9341_GREEN);
+    }
+
     esp_now_send(slaveAddress, (uint8_t *)&datosParaEnviar, sizeof(datosParaEnviar));
     delay(20);
 }
