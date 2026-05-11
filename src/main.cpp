@@ -1,4 +1,4 @@
-#include <Arduino.h>
+/*#include <Arduino.h>
 #include <esp_now.h>
 #include <WiFi.h>
 #include <SPI.h>
@@ -589,4 +589,738 @@ void loop()
 
     esp_now_send(slaveAddress, (uint8_t *)&datosParaEnviar, sizeof(datosParaEnviar));
     delay(20);
+}
+    */
+
+#include <Arduino.h>
+#include <esp_now.h>
+#include <WiFi.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <Wire.h>
+#include <Adafruit_AHTX0.h>
+#include <TinyGPSPlus.h>
+#include <TJpg_Decoder.h>
+#include <HTTPClient.h>
+
+// ====================================================================
+// 1. PINES DE CONEXIÓN DEL HARDWARE
+// ====================================================================
+// Pantalla TFT
+#define TFT_CS 15
+#define TFT_DC 2
+#define TFT_RST 4
+// Pines Generales Maestro
+#define TRIG_PIN 5
+#define ECHO_PIN 12
+#define IR_PIN 19
+#define LDR_PIN 34
+#define BOTON_PIN 13  // Botón para modo Fiesta
+#define BOTON_CCTV 14 // Botón Switch (Pantalla/Cámara)
+#define BUZZER_PIN 25
+#define PIN_AGUA 35
+#define PIN_IR_PLUMA 26
+// Elevador y Parking
+#define PIN_TOUCH1 36
+#define PIN_TOUCH2 39
+#define PIN_HALL 27
+// Comunicaciones Seriales (GSM / GPS)
+#define RXD2 16
+#define TXD2 17
+#define RX_GSM 32
+#define TX_GSM 33
+
+// ====================================================================
+// 2. AJUSTES MODIFICABLES (¡Aquí cambias el comportamiento del edificio!)
+// ====================================================================
+// --- Red y Cámara CCTV ---
+const char *ssidCam = "Maqueta_Seguridad";
+const char *passCam = "tecnmlagos";
+String urlCam = "http://192.168.4.1/";
+
+// --- Umbrales de Sensores ---
+const int umbralLuz = 1000;       // Nivel de luz para apagar fiesta automáticamente
+const int distanciaMinima = 5;    // Centímetros mínimos para detectar persona en pasillo
+const int distanciaMaxima = 15;   // Centímetros máximos para detectar persona en pasillo
+const int lecturasRequeridas = 3; // Filtro antifantasmas (cuántas lecturas seguidas para confirmar)
+float tempUmbral = 30.0;          // Temperatura a la que enciende el ventilador
+int umbralSismo = 8000;           // Fuerza necesaria del MPU6050 para disparar la alarma
+int umbralLluvia = 500;           // Lectura del sensor de gotas para detectar lluvia
+
+// --- Tiempos y Retardos (en milisegundos) ---
+const unsigned long tiempoEsperaLeds = 3000;       // Tiempo que siguen prendidos los LEDs tras no detectar persona
+const unsigned long tiempoEsperaEntrada = 3000;    // Tiempo que la puerta espera antes de considerarse cerrada
+const unsigned long TIEMPO_ESPERA_PLUMA = 3000;    // Tiempo que la pluma se mantiene arriba
+const unsigned long TIEMPO_ESPERA_ELEVADOR = 3000; // Tiempo que el elevador espera en el piso con puertas abiertas
+const unsigned long TIEMPO_TRAYECTO = 7000;        // Segundos que tarda tu motor físico en subir de piso 1 al 2
+
+// --- Alerta de Estacionamiento VIP ---
+String numeroDestino = "+524747375924"; // Número de celular al que llega el SMS del GSM
+
+// --- Dirección del Esclavo (ESP-NOW) ---
+uint8_t slaveAddress[] = {0x08, 0xD1, 0xF9, 0xD2, 0x22, 0xF4};
+
+// ====================================================================
+// 3. VARIABLES INTERNAS DE ESTADO (¡No tocar si no es necesario!)
+// ====================================================================
+// Estado del Sistema
+bool modoCamaraActivo = false;
+unsigned long ultimoDebounceBoton = 0;
+bool fiestaActiva = false;
+bool sismoActivo = false;
+bool lluviaActiva = false;
+
+// Sensores y Tiempos
+unsigned long millisPluma = 0;
+unsigned long ultimaVezDetectadoPasillo = 0;
+unsigned long ultimaVezDetectadoEntrada = 0;
+int lecturasPositivas = 0;
+float tempActual = 0.0;
+unsigned long ultimaLecturaClima = 0;
+unsigned long ultimoMilisSensor = 0;
+unsigned long ultimoMilisAgua = 0;
+
+// Variables MPU6050
+Adafruit_AHTX0 aht;
+const int MPU = 0x68;
+int16_t AcX, AcY, AcZ;
+long baseAcX = 0, baseAcY = 0, baseAcZ = 0;
+int repeticionesSismo = 0;
+
+// GSM y GPS
+TinyGPSPlus gps;
+bool cocheEstacionado = false;
+bool mensajeEnviado = false;
+bool gsmListo = false;
+bool gpsListo = false;
+bool sistemaArmado = false;
+unsigned long ultimoMilisCheckGSM = 0;
+
+// Elevador Simulado
+bool sim_elevadorEnPiso1 = true;
+bool sim_elevadorEnViaje = false;
+bool sim_esperando = false;
+unsigned long sim_tiempoApertura = 0;
+unsigned long sim_tiempoViaje = 0;
+
+// ====================================================================
+// 4. MELODÍAS DEL SISTEMA
+// ====================================================================
+int melodiaFiesta[] = {466, 0, 523, 466, 466, 587, 466, 415, 466, 0, 698, 466, 466, 784, 698, 523, 466, 698, 932, 466, 415, 415, 349, 523, 466};
+int duracionNotas[] = {150, 50, 150, 150, 50, 150, 150, 150, 150, 50, 150, 150, 50, 150, 150, 150, 150, 150, 150, 50, 150, 50, 150, 150, 400};
+int totalNotas = 25;
+int notaActual = 0;
+unsigned long tiempoUltimaNota = 0;
+
+int melodiaSismo[] = {300, 325, 350, 375, 400, 425, 450, 475, 500, 525, 550, 575, 600, 625, 650, 675, 700, 725, 750, 0};
+int duracionSismo[] = {30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 400};
+int totalNotasSismo = 20;
+int notaActualSismo = 0;
+unsigned long tiempoUltimaNotaSismo = 0;
+
+int melodiaLluvia[] = {1000, 0, 1200, 0};
+int duracionLluvia[] = {50, 50, 50, 1000};
+int totalNotasLluvia = 4;
+int notaActualLluvia = 0;
+unsigned long tiempoUltimaNotaLluvia = 0;
+bool buzzerSonando = false;
+
+// ====================================================================
+// 5. OBJETOS ESP-NOW Y PANTALLA TFT
+// ====================================================================
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+esp_now_peer_info_t peerInfo;
+
+typedef struct struct_message
+{
+    bool presenciaPasillo;
+    bool presenciaEntrada;
+    bool fiestaActiva;
+    bool touchPiso1;
+    bool touchPiso2;
+    bool ventiladorActivo;
+    bool abrirPluma;
+} struct_message;
+
+struct_message datosParaEnviar;
+
+// Memoria de la Pantalla TFT (Para evitar parpadeos)
+bool tft_sismo = false, tft_lluvia = false, tft_pasillo = false, tft_entrada = false;
+bool tft_fiesta = false, tft_pluma = false, tft_coche = false;
+float tft_temp = -100.0;
+int tft_estadoSenal = -1, tft_elevador = -1;
+
+// ====================================================================
+// FUNCIONES AUXILIARES DE INTERFAZ
+// ====================================================================
+void actualizarFilaTFT(int y, String nombre, String estado, uint16_t colorEstado)
+{
+    if (modoCamaraActivo)
+        return; // Si la cámara está activa, ignoramos actualizaciones
+    tft.setTextSize(2);
+    tft.fillRect(130, y, 190, 16, ILI9341_BLACK);
+    tft.setCursor(10, y);
+    tft.setTextColor(ILI9341_WHITE);
+    tft.print(nombre);
+    tft.setCursor(130, y);
+    tft.setTextColor(colorEstado);
+    tft.print(estado);
+}
+
+void redibujarPanelSensores()
+{
+    tft.fillScreen(ILI9341_BLACK);
+    tft.fillRect(0, 0, 320, 26, ILI9341_NAVY);
+    tft.setCursor(20, 5);
+    tft.setTextColor(ILI9341_WHITE);
+    tft.setTextSize(2);
+    tft.println("PANEL TECNM LAGOS");
+
+    // Forzamos a la memoria a ser distinta para que el loop redibuje todos los valores
+    tft_estadoSenal = -1;
+    tft_sismo = !tft_sismo;
+    tft_lluvia = !tft_lluvia;
+    tft_temp = -100.0;
+    tft_pasillo = !tft_pasillo;
+    tft_entrada = !tft_entrada;
+    tft_pluma = !tft_pluma;
+    tft_coche = !tft_coche;
+    tft_fiesta = !tft_fiesta;
+    tft_elevador = -1;
+}
+
+// ====================================================================
+// CORE 0: TAREA EXCLUSIVA DEL VIDEO CCTV
+// ====================================================================
+bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap)
+{
+    if (!modoCamaraActivo || y >= tft.height())
+        return 0;
+    tft.drawRGBBitmap(x, y, bitmap, w, h);
+    return 1;
+}
+
+void TaskCamara(void *pvParameters)
+{
+    WiFi.begin(ssidCam, passCam);
+    TJpgDec.setJpgScale(1);
+    TJpgDec.setCallback(tft_output);
+
+    for (;;)
+    {
+        if (modoCamaraActivo && WiFi.status() == WL_CONNECTED)
+        {
+            HTTPClient http;
+            http.begin(urlCam);
+            int httpCode = http.GET();
+            if (httpCode == HTTP_CODE_OK)
+            {
+                int len = http.getSize();
+                WiFiClient *stream = http.getStreamPtr();
+                uint8_t *outBuf = (uint8_t *)malloc(len);
+                if (outBuf)
+                {
+                    // Descarga ultrarrápida del JPEG
+                    int bytesLeidos = 0;
+                    uint8_t buff[128] = {0};
+                    while (http.connected() && (len > 0 || len == -1))
+                    {
+                        size_t size = stream->available();
+                        if (size)
+                        {
+                            int c = stream->readBytes(buff, ((size > sizeof(buff)) ? sizeof(buff) : size));
+                            memcpy(outBuf + bytesLeidos, buff, c);
+                            bytesLeidos += c;
+                            if (len > 0)
+                                len -= c;
+                        }
+                        delay(1);
+                    }
+                    // Decodificar y mandar a pantalla
+                    TJpgDec.drawJpg(0, 0, outBuf, bytesLeidos);
+                    free(outBuf);
+                }
+            }
+            http.end();
+            vTaskDelay(200 / portTICK_PERIOD_MS); // Control de FPS para estabilidad
+        }
+        else
+        {
+            vTaskDelay(500 / portTICK_PERIOD_MS); // Si no está en modo cámara, descansa
+        }
+    }
+}
+
+// ====================================================================
+// INICIALIZACIÓN DEL SISTEMA
+// ====================================================================
+void setup()
+{
+    Serial.begin(115200);
+    pinMode(BOTON_CCTV, INPUT_PULLUP);
+
+    // Iniciar Comunicaciones
+    Serial1.begin(9600, SERIAL_8N1, RX_GSM, TX_GSM);
+    Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
+    Wire.begin();
+    if (!aht.begin())
+        Serial.println("Aviso: Sensor AHT no detectado.");
+
+    // Calibración MPU6050
+    Wire.beginTransmission(MPU);
+    Wire.write(0x6B);
+    Wire.write(0);
+    Wire.endTransmission(true);
+    delay(2000);
+    for (int i = 0; i < 100; i++)
+    {
+        Wire.beginTransmission(MPU);
+        Wire.write(0x3B);
+        Wire.endTransmission(false);
+        Wire.requestFrom(MPU, 6, true);
+        int16_t tempX = Wire.read() << 8 | Wire.read();
+        int16_t tempY = Wire.read() << 8 | Wire.read();
+        int16_t tempZ = Wire.read() << 8 | Wire.read();
+        baseAcX += tempX;
+        baseAcY += tempY;
+        baseAcZ += tempZ;
+        delay(10);
+    }
+    baseAcX /= 100;
+    baseAcY /= 100;
+    baseAcZ /= 100;
+
+    // Inicializar Pantalla
+    tft.begin();
+    tft.setRotation(1);
+    redibujarPanelSensores();
+
+    // Configuración de Pines
+    pinMode(TRIG_PIN, OUTPUT);
+    pinMode(ECHO_PIN, INPUT);
+    pinMode(IR_PIN, INPUT);
+    pinMode(BOTON_PIN, INPUT_PULLUP);
+    pinMode(BUZZER_PIN, OUTPUT);
+    pinMode(PIN_TOUCH1, INPUT);
+    pinMode(PIN_TOUCH2, INPUT);
+    pinMode(PIN_HALL, INPUT_PULLUP);
+    pinMode(PIN_IR_PLUMA, INPUT);
+
+    // Inicializar ESP-NOW
+    WiFi.mode(WIFI_STA);
+    if (esp_now_init() == ESP_OK)
+    {
+        memcpy(peerInfo.peer_addr, slaveAddress, 6);
+        peerInfo.channel = 0;
+        peerInfo.encrypt = false;
+        esp_now_add_peer(&peerInfo);
+    }
+
+    // CREAR TAREA DEL VIDEO EN EL NÚCLEO 0
+    xTaskCreatePinnedToCore(TaskCamara, "TaskCamara", 10000, NULL, 1, NULL, 0);
+}
+
+// ====================================================================
+// CORE 1: CICLO MAESTRO DEL EDIFICIO (LOOP)
+// ====================================================================
+void loop()
+{
+    unsigned long tiempoActual = millis();
+
+    // ==========================================
+    // MODULO 0: CONTROL DE INTERFAZ (BOTÓN CCTV)
+    // ==========================================
+    if (digitalRead(BOTON_CCTV) == LOW && (tiempoActual - ultimoDebounceBoton > 500))
+    {
+        modoCamaraActivo = !modoCamaraActivo; // Toggle
+        ultimoDebounceBoton = tiempoActual;
+        if (!modoCamaraActivo)
+        {
+            redibujarPanelSensores();
+        }
+        else
+        {
+            tft.fillScreen(ILI9341_BLACK);
+            tft.setCursor(10, 110);
+            tft.print("Cargando Camara...");
+        }
+    }
+
+    // ==========================================
+    // MODULO 1: GPS Y GSM (ESTACIONAMIENTO)
+    // ==========================================
+    while (Serial2.available() > 0)
+        gps.encode(Serial2.read());
+
+    if (!sistemaArmado)
+    {
+        if (!gsmListo && (tiempoActual - ultimoMilisCheckGSM >= 3000))
+        {
+            ultimoMilisCheckGSM = tiempoActual;
+            Serial1.println("AT+CREG?");
+            String respuesta = "";
+            while (Serial1.available())
+                respuesta += (char)Serial1.read();
+            if (respuesta.indexOf("0,1") != -1 || respuesta.indexOf("0,5") != -1)
+                gsmListo = true;
+        }
+        if (gsmListo && !gpsListo && gps.location.isValid())
+        {
+            gpsListo = true;
+            sistemaArmado = true;
+        }
+    }
+
+    if (sistemaArmado)
+    {
+        if (digitalRead(PIN_HALL) == LOW)
+            cocheEstacionado = true;
+        else
+        {
+            cocheEstacionado = false;
+            mensajeEnviado = false;
+        }
+
+        if (cocheEstacionado && !mensajeEnviado)
+        {
+            String linkMaps = "http://googleusercontent.com/maps.google.com/maps?q=" + String(gps.location.lat(), 6) + "," + String(gps.location.lng(), 6);
+            Serial1.println("AT+CMGF=1");
+            delay(1000);
+            Serial1.print("AT+CMGS=\"");
+            Serial1.print(numeroDestino);
+            Serial1.println("\"");
+            delay(1000);
+            Serial1.print("El coche ha llegado a la maqueta! Ubicacion: " + linkMaps);
+            delay(500);
+            Serial1.write(26);
+            mensajeEnviado = true;
+        }
+    }
+
+    // ==========================================
+    // MODULO 2: SENSORES DE PRESENCIA (PASILLO Y ENTRADA)
+    // ==========================================
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+    int distancia = (pulseIn(ECHO_PIN, HIGH, 30000)) * 0.034 / 2;
+    if (distancia == 0 || distancia > 400)
+        distancia = 999;
+
+    if (distancia >= distanciaMinima && distancia <= distanciaMaxima)
+    {
+        lecturasPositivas++;
+        if (lecturasPositivas >= lecturasRequeridas)
+        {
+            ultimaVezDetectadoPasillo = tiempoActual;
+            datosParaEnviar.presenciaPasillo = true;
+        }
+    }
+    else
+    {
+        lecturasPositivas = 0;
+        datosParaEnviar.presenciaPasillo = (tiempoActual - ultimaVezDetectadoPasillo < tiempoEsperaLeds);
+    }
+
+    if (digitalRead(IR_PIN) == LOW)
+    {
+        ultimaVezDetectadoEntrada = tiempoActual;
+        datosParaEnviar.presenciaEntrada = true;
+    }
+    else
+    {
+        datosParaEnviar.presenciaEntrada = (tiempoActual - ultimaVezDetectadoEntrada < tiempoEsperaEntrada);
+    }
+
+    // ==========================================
+    // MODULO 3: FIESTA Y LDR
+    // ==========================================
+    int valorLuz = analogRead(LDR_PIN);
+    if (valorLuz > umbralLuz)
+        fiestaActiva = false;
+    else if (digitalRead(BOTON_PIN) == LOW)
+        fiestaActiva = true;
+    datosParaEnviar.fiestaActiva = fiestaActiva;
+
+    // ==========================================
+    // MODULO 4: ELEVADOR SIMULADO Y CLIMA
+    // ==========================================
+    // --- FILTRO ANTI-FANTASMAS PARA LOS TOUCH ---
+    static int contadorTouch1 = 0;
+    static int contadorTouch2 = 0;
+
+    // Filtro Piso 1
+    if (digitalRead(PIN_TOUCH1) == HIGH)
+    {
+        contadorTouch1++;
+        // Solo si lee 5 veces seguidas el toque, lo da por bueno
+        if (contadorTouch1 >= 100)
+            datosParaEnviar.touchPiso1 = true;
+    }
+    else
+    {
+        contadorTouch1 = 0; // Se resetea si fue solo un pico de ruido
+        datosParaEnviar.touchPiso1 = false;
+    }
+
+    // Filtro Piso 2
+    if (digitalRead(PIN_TOUCH2) == HIGH)
+    {
+        contadorTouch2++;
+        if (contadorTouch2 >= 100)
+            datosParaEnviar.touchPiso2 = true;
+    }
+    else
+    {
+        contadorTouch2 = 0;
+        datosParaEnviar.touchPiso2 = false;
+    }
+
+    if (!sim_elevadorEnViaje && !sim_esperando)
+    {
+        if (datosParaEnviar.touchPiso1 || datosParaEnviar.touchPiso2)
+        {
+            sim_esperando = true;
+            sim_tiempoApertura = tiempoActual;
+        }
+    }
+    if (sim_esperando && (tiempoActual - sim_tiempoApertura >= TIEMPO_ESPERA_ELEVADOR))
+    {
+        sim_esperando = false;
+        sim_elevadorEnViaje = true;
+        sim_tiempoViaje = tiempoActual;
+    }
+    if (sim_elevadorEnViaje && (tiempoActual - sim_tiempoViaje >= TIEMPO_TRAYECTO))
+    {
+        sim_elevadorEnViaje = false;
+        sim_elevadorEnPiso1 = !sim_elevadorEnPiso1;
+    }
+
+    if (tiempoActual - ultimaLecturaClima >= 2000)
+    {
+        sensors_event_t h, t;
+        aht.getEvent(&h, &t);
+        tempActual = t.temperature;
+        datosParaEnviar.ventiladorActivo = (tempActual >= tempUmbral);
+        ultimaLecturaClima = tiempoActual;
+    }
+
+    // ==========================================
+    // MODULO 5: SISMO Y AGUA (SEGURIDAD)
+    // ==========================================
+    if (tiempoActual - ultimoMilisSensor >= 50)
+    {
+        ultimoMilisSensor = tiempoActual;
+        Wire.beginTransmission(MPU);
+        Wire.write(0x3B);
+        Wire.endTransmission(false);
+        Wire.requestFrom(MPU, 6, true);
+        AcX = Wire.read() << 8 | Wire.read();
+        AcY = Wire.read() << 8 | Wire.read();
+        AcZ = Wire.read() << 8 | Wire.read();
+        long difX = abs((long)AcX - baseAcX);
+        long difY = abs((long)AcY - baseAcY);
+        long difZ = abs((long)AcZ - baseAcZ);
+        if ((difX > umbralSismo || difY > umbralSismo || difZ > umbralSismo) && !sismoActivo)
+        {
+            sismoActivo = true;
+            notaActualSismo = 0;
+            repeticionesSismo = 0;
+            tiempoUltimaNotaSismo = tiempoActual;
+        }
+    }
+
+    if (tiempoActual - ultimoMilisAgua >= 500)
+    {
+        int lecturaAgua = analogRead(PIN_AGUA);
+        ultimoMilisAgua = tiempoActual;
+        if (lecturaAgua > umbralLluvia)
+        {
+            if (!lluviaActiva)
+            {
+                lluviaActiva = true;
+                notaActualLluvia = 0;
+                tiempoUltimaNotaLluvia = tiempoActual;
+            }
+        }
+        else
+        {
+            lluviaActiva = false;
+        }
+    }
+
+    // ==========================================
+    // MODULO 6: AUDIO Y PLUMA REPARADA
+    // ==========================================
+    if (sismoActivo)
+    {
+        buzzerSonando = true;
+        if (tiempoActual - tiempoUltimaNotaSismo >= duracionSismo[notaActualSismo])
+        {
+            if (melodiaSismo[notaActualSismo] > 0)
+                tone(BUZZER_PIN, melodiaSismo[notaActualSismo], duracionSismo[notaActualSismo] - 5);
+            else
+                noTone(BUZZER_PIN);
+            notaActualSismo++;
+            if (notaActualSismo >= totalNotasSismo)
+            {
+                notaActualSismo = 0;
+                repeticionesSismo++;
+                if (repeticionesSismo >= 4)
+                {
+                    sismoActivo = false;
+                    notaActual = 0;
+                    notaActualLluvia = 0;
+                }
+            }
+            tiempoUltimaNotaSismo = tiempoActual;
+        }
+    }
+    else if (lluviaActiva)
+    {
+        buzzerSonando = true;
+        if (tiempoActual - tiempoUltimaNotaLluvia >= duracionLluvia[notaActualLluvia])
+        {
+            if (melodiaLluvia[notaActualLluvia] > 0)
+                tone(BUZZER_PIN, melodiaLluvia[notaActualLluvia], duracionLluvia[notaActualLluvia] - 5);
+            else
+                noTone(BUZZER_PIN);
+            notaActualLluvia++;
+            if (notaActualLluvia >= totalNotasLluvia)
+                notaActualLluvia = 0;
+            tiempoUltimaNotaLluvia = tiempoActual;
+        }
+    }
+    else if (fiestaActiva)
+    {
+        buzzerSonando = true;
+        if (tiempoActual - tiempoUltimaNota >= duracionNotas[notaActual])
+        {
+            if (melodiaFiesta[notaActual] > 0)
+                tone(BUZZER_PIN, melodiaFiesta[notaActual], duracionNotas[notaActual] - 20);
+            else
+                noTone(BUZZER_PIN);
+            notaActual++;
+            if (notaActual >= totalNotas)
+                notaActual = 0;
+            tiempoUltimaNota = tiempoActual;
+        }
+    }
+    else
+    {
+        if (buzzerSonando)
+        {
+            noTone(BUZZER_PIN);
+            buzzerSonando = false;
+        }
+        notaActual = 0;
+        notaActualSismo = 0;
+        notaActualLluvia = 0;
+    }
+
+    if (digitalRead(PIN_IR_PLUMA) == LOW)
+    {
+        datosParaEnviar.abrirPluma = true;
+        millisPluma = tiempoActual;
+    }
+    else
+    {
+        if (datosParaEnviar.abrirPluma && (tiempoActual - millisPluma >= TIEMPO_ESPERA_PLUMA))
+            datosParaEnviar.abrirPluma = false;
+    }
+
+    // ==========================================
+    // MODULO 7: ACTUALIZACIÓN INTELIGENTE DE TFT
+    // ==========================================
+    if (!modoCamaraActivo)
+    {
+        int estadoActualSenal = 0;
+        if (sistemaArmado)
+            estadoActualSenal = 2;
+        else if (gsmListo)
+            estadoActualSenal = 1;
+
+        if (estadoActualSenal != tft_estadoSenal)
+        {
+            tft_estadoSenal = estadoActualSenal;
+            if (estadoActualSenal == 0)
+                actualizarFilaTFT(34, "Senal:", "BUSCANDO RED", ILI9341_ORANGE);
+            else if (estadoActualSenal == 1)
+                actualizarFilaTFT(34, "Senal:", "BUSCANDO GPS", ILI9341_YELLOW);
+            else if (estadoActualSenal == 2)
+                actualizarFilaTFT(34, "Senal:", "EN LINEA", ILI9341_GREEN);
+        }
+
+        if (sismoActivo != tft_sismo)
+        {
+            tft_sismo = sismoActivo;
+            actualizarFilaTFT(54, "Sismo:", sismoActivo ? "PELIGRO!!" : "SEGURO", sismoActivo ? ILI9341_RED : ILI9341_GREEN);
+        }
+        if (lluviaActiva != tft_lluvia)
+        {
+            tft_lluvia = lluviaActiva;
+            actualizarFilaTFT(74, "Lluvia:", lluviaActiva ? "LLOVIENDO" : "DESPEJADO", lluviaActiva ? ILI9341_BLUE : ILI9341_GREEN);
+        }
+
+        if (abs(tempActual - tft_temp) >= 0.5 && tempActual > 0)
+        {
+            tft_temp = tempActual;
+            String textoTemp = String(tft_temp, 1) + "C";
+            if (datosParaEnviar.ventiladorActivo)
+                actualizarFilaTFT(94, "Clima:", textoTemp + " (V:ON)", ILI9341_ORANGE);
+            else
+                actualizarFilaTFT(94, "Clima:", textoTemp + " (V:OFF)", ILI9341_CYAN);
+        }
+
+        if (datosParaEnviar.presenciaPasillo != tft_pasillo)
+        {
+            tft_pasillo = datosParaEnviar.presenciaPasillo;
+            actualizarFilaTFT(114, "Pasillo:", tft_pasillo ? "DETECTADO" : "VACIO", tft_pasillo ? ILI9341_RED : ILI9341_GREEN);
+        }
+        if (datosParaEnviar.presenciaEntrada != tft_entrada)
+        {
+            tft_entrada = datosParaEnviar.presenciaEntrada;
+            actualizarFilaTFT(134, "Puertas:", tft_entrada ? "ABIERTAS" : "CERRADAS", tft_entrada ? ILI9341_YELLOW : ILI9341_GREEN);
+        }
+        if (datosParaEnviar.abrirPluma != tft_pluma)
+        {
+            tft_pluma = datosParaEnviar.abrirPluma;
+            actualizarFilaTFT(154, "Pluma:", tft_pluma ? "ARRIBA" : "ABAJO", tft_pluma ? ILI9341_YELLOW : ILI9341_GREEN);
+        }
+        if (cocheEstacionado != tft_coche)
+        {
+            tft_coche = cocheEstacionado;
+            actualizarFilaTFT(174, "Parking:", tft_coche ? "OCUPADO" : "LIBRE", tft_coche ? ILI9341_RED : ILI9341_GREEN);
+        }
+        if (fiestaActiva != tft_fiesta)
+        {
+            tft_fiesta = fiestaActiva;
+            actualizarFilaTFT(194, "Fiesta:", tft_fiesta ? "ON" : "OFF", tft_fiesta ? ILI9341_MAGENTA : ILI9341_LIGHTGREY);
+        }
+
+        int estadoElevador = 0;
+        if (sim_elevadorEnViaje)
+            estadoElevador = 1;
+        else if (!sim_elevadorEnPiso1)
+            estadoElevador = 2;
+        if (estadoElevador != tft_elevador)
+        {
+            tft_elevador = estadoElevador;
+            if (estadoElevador == 0)
+                actualizarFilaTFT(214, "Elevador:", "PISO 1 (OFF)", ILI9341_LIGHTGREY);
+            else if (estadoElevador == 1)
+                actualizarFilaTFT(214, "Elevador:", "MOVIENDO...", ILI9341_YELLOW);
+            else if (estadoElevador == 2)
+                actualizarFilaTFT(214, "Elevador:", "PISO 2 (ON)", ILI9341_GREEN);
+        }
+    }
+
+    // ==========================================
+    // MODULO 8: COMUNICACIÓN ESP-NOW
+    // ==========================================
+    esp_now_send(slaveAddress, (uint8_t *)&datosParaEnviar, sizeof(datosParaEnviar));
+    delay(20); // Mini-descanso para la antena de 2.4GHz
 }
